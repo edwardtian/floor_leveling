@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Floor Leveling Editor</title>
+</head>
+<body>
+  <div id="app">
+    <div id="viewport"></div>
+    <div id="topbar">
+      <button id="btn-import" class="btn">Import…</button>
+      <button id="btn-export-glb" class="btn" disabled>Export GLB</button>
+      <button id="btn-export-obj" class="btn" disabled>Export OBJ</button>
+      <span class="sep"></span>
+      <button id="btn-undo" class="btn" title="Ctrl+Z">Undo</button>
+      <button id="btn-redo" class="btn" title="Ctrl+Shift+Z">Redo</button>
+      <span class="sep"></span>
+      <label class="chk"><input type="checkbox" id="chk-showfloor" /> Floor</label>
+      <label class="chk"><input type="checkbox" id="chk-showref" /> Ref</label>
+      <label class="chk"><input type="checkbox" id="chk-showwires" /> Wire</label>
+      <label class="chk"><input type="checkbox" id="chk-showgrid" checked /> Grid</label>
+      <span class="sep"></span>
+      <span id="status" class="status">Import a model to begin.</span>
+    </div>
+    <div id="toolbar">
+      <button id="tool-select" class="tbtn active" title="Select / orbit">Select</button>
+      <button id="tool-transform" class="tbtn" title="Rotate/translate/scale whole objects, then Apply">Transform</button>
+      <button id="tool-segment" class="tbtn" title="Slice model into N×M segments">Segment</button>
+      <button id="tool-floor" class="tbtn" title="Floor plane + leveling">Floor</button>
+      <button id="tool-ref" class="tbtn" title="Reference image">Ref Image</button>
+    </div>
+    <div id="panel">
+      <div id="panel-title">Tools</div>
+      <div id="panel-body"></div>
+    </div>
+    <div id="toast" class="hidden"></div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
