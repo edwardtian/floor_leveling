@@ -42,10 +42,14 @@ export function unitField(
   sceneValue: number,
   getUnits: () => 'meter' | 'centimeter',
   onChange: (scene: number) => void,
-  opts: { step?: number; min?: number; max?: number; integer?: boolean } = {},
+  opts: { step?: number; min?: number; max?: number; integer?: boolean; axis?: 'x' | 'y' | 'z' } = {},
 ): UnitField {
   const root = el('div', 'row');
   const lab = el('label', undefined, label);
+  if (opts.axis) {
+    lab.style.color = AXIS_UI_COLOR[opts.axis];
+    lab.style.fontWeight = '600';
+  }
   const input = el('input') as HTMLInputElement;
   input.type = 'number';
   input.step = String(opts.step ?? 0.1);
@@ -96,15 +100,26 @@ export function unitField(
   };
 }
 
+/** Viewport gizmo axis colors (shared with navGizmo). */
+export const AXIS_UI_COLOR: Record<'x' | 'y' | 'z', string> = {
+  x: '#e0554e',
+  y: '#8bc34a',
+  z: '#42a5f5',
+};
+
 /** Plain numeric field (no units — degrees, counts). */
 export function numField(
   label: string,
   value: number,
   onChange: (v: number) => void,
-  opts: { step?: number; min?: number; max?: number; integer?: boolean } = {},
+  opts: { step?: number; min?: number; max?: number; integer?: boolean; axis?: 'x' | 'y' | 'z' } = {},
 ): HTMLDivElement {
   const root = el('div', 'row');
   const lab = el('label', undefined, label);
+  if (opts.axis) {
+    lab.style.color = AXIS_UI_COLOR[opts.axis];
+    lab.style.fontWeight = '600';
+  }
   const input = el('input') as HTMLInputElement;
   input.type = 'number';
   input.step = String(opts.step ?? 1);
@@ -222,6 +237,7 @@ export interface ModalButton {
 export function modal(title: string, bodyHtml: string, buttons: ModalButton[]): Promise<string | null> {
   return new Promise((resolve) => {
     const overlay = el('div');
+    overlay.className = 'modal-overlay';
     overlay.style.cssText =
       'position:fixed;inset:0;background:rgba(0,0,0,0.55);display:flex;align-items:center;justify-content:center;z-index:100;';
     const box = el('div');

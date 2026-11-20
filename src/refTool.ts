@@ -1,11 +1,15 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
 import { baseName } from './modelUtils';
+import { PendingNodeTransform } from './objectTransform';
+import type { History } from './history';
 
 /**
  * Reference image tool (R3): an image on a plane the user can translate,
  * rotate and scale with the gizmo (or numeric fields). Purely a guide —
- * never exported, never segmented.
+ * never exported, never segmented. Gizmo drags go through a PENDING node
+ * transform (preview → Apply bakes → Reset discards), like the model's
+ * Transform tool.
  */
 export class RefTool {
   active = false;
@@ -21,11 +25,15 @@ export class RefTool {
   private editor: Editor;
   private onChanged: () => void;
 
+  /** Pending node transform (preview → apply/reset), like the model's. */
+  readonly nodeTransform: PendingNodeTransform;
+
   gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
 
-  constructor(editor: Editor, onChanged: () => void) {
+  constructor(editor: Editor, history: History | null, onChanged: () => void) {
     this.editor = editor;
     this.onChanged = onChanged;
+    this.nodeTransform = new PendingNodeTransform(editor, history, onChanged, 'RefTransformProxy');
 
     this.mat = new THREE.MeshBasicMaterial({
       color: 0xffffff,
@@ -41,6 +49,7 @@ export class RefTool {
     this.group.name = 'ReferenceImage';
     this.group.visible = false;
     editor.scene.add(this.group);
+    this.nodeTransform.setTarget(this.group);
   }
 
   get hasImage(): boolean {
@@ -55,7 +64,7 @@ export class RefTool {
     const was = this.active;
     this.active = v;
     if (v && this.hasImage) {
-      this.editor.attachGizmo(this.group, this.gizmoMode, 'world');
+      this.nodeTransform.attachGizmo(this.gizmoMode);
       this.syncFields();
     } else if (!v && was) {
       // Detach only on the active→inactive transition: other tools own the
@@ -68,7 +77,24 @@ export class RefTool {
 
   setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
     this.gizmoMode = mode;
-    if (this.active && this.hasImage) this.editor.attachGizmo(this.group, mode, 'world');
+    if (this.active && this.hasImage) this.nodeTransform.attachGizmo(mode);
+  }
+
+  /** Bake the pending transform into the image node (undoable). */
+  applyTransform(): boolean {
+    const ok = this.nodeTransform.apply();
+    if (ok) this.onChanged();
+    return ok;
+  }
+
+  /** Discard the pending transform. */
+  resetTransform(): void {
+    this.nodeTransform.reset();
+    this.syncFields();
+  }
+
+  hasPendingTransform(): boolean {
+    return this.nodeTransform.hasPending;
   }
 
   async loadImage(file: File): Promise<void> {
@@ -108,6 +134,7 @@ export class RefTool {
     this.group.position.set(0, minY + 0.01, 0);
     this.group.rotation.y = 0;
     this.group.visible = true;
+    this.nodeTransform.setTarget(this.group); // fresh base, no pending
     this.onChanged();
   }
 
@@ -145,29 +172,34 @@ export class RefTool {
   setSize(width: number, height: number): void {
     const o = this.getOrientation();
     if (o === 'horizontal') {
-      this.group.scale.set(width / this.baseW, 1, height / this.baseH);
+      this.nodeTransform.setWorldScale({ x: width, z: height });
     } else {
-      this.group.scale.set(width / this.baseW, height / this.baseH, 1);
+      this.nodeTransform.setWorldScale({ x: width, y: height });
     }
     this.onChanged();
   }
 
   /** Current world-space size (width × height in meters). */
   getSize(): { w: number; h: number } {
-    this.group.updateMatrixWorld(true);
+    if (this.hasPendingTransform()) this.group.updateMatrixWorld(true);
+    else this.group.updateMatrix();
     const box = new THREE.Box3().setFromObject(this.plane);
     const s = box.getSize(new THREE.Vector3());
     const o = this.getOrientation();
     return o === 'horizontal' ? { w: s.x, h: s.z } : { w: s.x, h: s.y };
   }
 
+  /**
+   * Numeric placement edits go through the SAME pending transform as the
+   * Transform sub-panel (preview on type; Apply bakes; Reset discards).
+   */
   setY(y: number): void {
-    this.group.position.y = y;
+    this.nodeTransform.setWorldPosition({ y });
     this.onChanged();
   }
 
   setAngleDeg(deg: number): void {
-    this.group.rotation.y = THREE.MathUtils.degToRad(deg);
+    this.nodeTransform.setWorldRotationDeg({ y: deg });
     this.onChanged();
   }
 

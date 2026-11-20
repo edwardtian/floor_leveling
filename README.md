@@ -44,6 +44,20 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
 - The caption under the gizmo shows the current state ("Front Orthographic", "User Perspective", ...).
 - In orthographic mode, zooming adjusts the frustum scale instead of dollying, and the TransformControls gizmo adapts automatically.
 
+## Keyboard shortcuts
+
+3ds Max-style manipulator keys — they act on the **currently active object** (model via Transform/FFD, floor plane, or reference image), not a fixed tool:
+
+| Key | Action |
+| --- | --- |
+| `Q` | Select tool (leaves any manipulator) |
+| `W` | **Move** (translate) the active object |
+| `E` | **Rotate** the active object |
+| `R` | **Scale** the active object |
+| `Tab` | Cycle the active object's Move → Rotate → Scale |
+
+"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Select tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` toggles ortho, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
+
 ## Export
 
 **Export GLB / Export OBJ** from the top bar:

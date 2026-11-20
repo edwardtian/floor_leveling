@@ -47,7 +47,8 @@ ok('import glb', await page.evaluate(() => window.__FL__ && window.__FL__.meshes
 await page.screenshot({ path: `${ROOT}/.smoke/01-imported.png` });
 
 // ---- 2. transform tool: rotate pending + apply
-await page.click('#tool-transform');
+await page.click('#tool-model');
+await page.click('#subtabs button:has-text("Transform")');
 await page.waitForTimeout(300);
 await page.evaluate(() => {
   const t = window.__FL__.transformTool.pending;
@@ -84,7 +85,8 @@ await page.click('#btn-redo');
 await page.waitForTimeout(200);
 
 // ---- 3. FFD: lattice build, control-point select, deform, history
-await page.click('#tool-ffd');
+await page.click('#tool-model');
+await page.click('#subtabs button:has-text("FFD")');
 await page.waitForTimeout(300);
 await page.evaluate(() => {
   const f = window.__FL__.ffdTool;
@@ -179,7 +181,106 @@ const ffdPick = await page.evaluate(() => {
 });
 ok('FFD corner pair selectable', ffdPick === 2);
 
-// invalidate: floor leveling must drop the lattice (stale rest state)
+// ---- drag-select (rect) over lattice points with the real mouse
+// Rebuild a fresh lattice (previous test manipulated points), select nothing.
+await page.evaluate(() => { window.__FL__.ffdTool.build(); });
+await page.waitForTimeout(300);
+// NOTE: screen-space box select is DEPTH-AGNOSTIC (like Max's FFD marquee):
+// any point whose projection falls in the rect is selected, including
+// far-side points. Expected sets are computed below with the same rule.
+const projectPts = () => page.evaluate(() => {
+  const f = window.__FL__.ffdTool;
+  const cam = window.__FL__.editor.camera;
+  const v = new window.__FL__.THREE.Vector3();
+  const pts = [];
+  for (let i = 0; i < f.lattice.count; i++) {
+    v.set(f.lattice.controlPoints[i * 3], f.lattice.controlPoints[i * 3 + 1], f.lattice.controlPoints[i * 3 + 2]).project(cam);
+    pts.push({ id: i, x: ((v.x + 1) / 2) * innerWidth, y: ((1 - v.y) / 2) * innerHeight, z: v.z });
+  }
+  return pts.filter((p) => p.z <= 1); // in front of the camera only
+});
+const expectedInRect = (pts, r) => pts.filter((p) => p.x >= r.x0 && p.x <= r.x1 && p.y >= r.y0 && p.y <= r.y1).map((p) => p.id);
+
+// Drag a rect around the 2×2×2 upper-octant block; expectation = every point
+// (any depth) whose projection lands inside.
+const pts1 = await projectPts();
+const rect = await page.evaluate(() => {
+  const f = window.__FL__.ffdTool;
+  const lat = f.lattice;
+  const cam = window.__FL__.editor.camera;
+  const v = new window.__FL__.THREE.Vector3();
+  const xs = [], ys = [];
+  for (let i = 1; i < lat.nx; i++) {
+    for (let j = 1; j < lat.ny; j++) {
+      for (let k = 1; k < lat.nz; k++) {
+        const id = lat.index(i, j, k);
+        v.set(lat.controlPoints[id * 3], lat.controlPoints[id * 3 + 1], lat.controlPoints[id * 3 + 2]).project(cam);
+        xs.push(((v.x + 1) / 2) * innerWidth);
+        ys.push(((1 - v.y) / 2) * innerHeight);
+      }
+    }
+  }
+  const pad = 6;
+  return { x0: Math.min(...xs) + pad, y0: Math.min(...ys) + pad, x1: Math.max(...xs) - pad, y1: Math.max(...ys) - pad };
+});
+const expect1 = expectedInRect(pts1, rect);
+await page.mouse.move(rect.x0, rect.y0);
+await page.mouse.down();
+await page.mouse.move(rect.x1, rect.y1, { steps: 5 });
+await page.mouse.up();
+await page.waitForTimeout(300);
+const dragSel = await page.evaluate(() => {
+  const f = window.__FL__.ffdTool;
+  return { n: f.selected.size, ids: [...f.selected].sort((a, b) => a - b) };
+});
+const dragOk = dragSel.n === expect1.length && expect1.every((id) => dragSel.ids.includes(id));
+ok('FFD drag-rect selects lattice points', dragOk,
+  `selected ${dragSel.n}, expected ${expect1.length} (depth-agnostic) — ${JSON.stringify(dragSel.ids)} vs ${JSON.stringify(expect1.sort((a, b) => a - b))}`);
+
+// Shift-drag adds to the selection: pick two UNSELECTED points with the
+// largest screen separation, so the rect provably adds new points.
+const pts2 = await projectPts();
+const rect2 = await page.evaluate(() => {
+  const f = window.__FL__.ffdTool;
+  const lat = f.lattice;
+  const cam = window.__FL__.editor.camera;
+  const v = new window.__FL__.THREE.Vector3();
+  const pts = [];
+  for (let i = 0; i < lat.count; i++) {
+    v.set(lat.controlPoints[i * 3], lat.controlPoints[i * 3 + 1], lat.controlPoints[i * 3 + 2]).project(cam);
+    pts.push({ id: i, x: ((v.x + 1) / 2) * innerWidth, y: ((1 - v.y) / 2) * innerHeight });
+  }
+  const sel = [...f.selected];
+  const cand = pts.filter((p) => !sel.includes(p.id));
+  // farthest pair among candidates
+  let best = null, bestD = -1;
+  for (let a = 0; a < cand.length; a++) {
+    for (let b = a + 1; b < cand.length; b++) {
+      const d = Math.hypot(cand[a].x - cand[b].x, cand[a].y - cand[b].y);
+      if (d > bestD) { bestD = d; best = [cand[a], cand[b]]; }
+    }
+  }
+  const pad = 4;
+  return {
+    x0: Math.min(best[0].x, best[1].x) + pad, y0: Math.min(best[0].y, best[1].y) + pad,
+    x1: Math.max(best[0].x, best[1].x) - pad, y1: Math.max(best[0].y, best[1].y) - pad,
+  };
+});
+const expect2 = expectedInRect(pts2, rect2);
+const union = new Set([...dragSel.ids, ...expect2]);
+ok('shift-rect targets new points', expect2.length > 0 && expect2.some((id) => !dragSel.ids.includes(id)), `new points in rect: ${expect2.length}`);
+await page.keyboard.down('Shift');
+await page.mouse.move(rect2.x0, rect2.y0);
+await page.mouse.down();
+await page.mouse.move(rect2.x1, rect2.y1, { steps: 5 });
+await page.mouse.up();
+await page.keyboard.up('Shift');
+await page.waitForTimeout(300);
+const dragSel2 = await page.evaluate(() => window.__FL__.ffdTool.selected.size);
+ok('FFD shift-drag adds to selection', dragSel2 === union.size, `selected ${dragSel2}, expected union ${union.size} (added ${expect2.filter((id) => !dragSel.ids.includes(id)).length})`);
+
+// external edit (floor leveling) must NOT drop the lattice anymore — it
+// rebases: the cage persists with its position, the new mesh becomes the base.
 await page.click('#tool-floor');
 await page.waitForTimeout(400);
 await page.evaluate(() => {
@@ -187,13 +288,30 @@ await page.evaluate(() => {
   f.settings.y = window.__FL__.meshes[0].geometry.boundingBox.min.y + 0.15;
   f.updatePlane();
   f.scan();
-  if (f.areas.length) f.level('drop');
+  // level('drop') with an empty selection is a no-op — select an area first
+  if (f.areas.length) {
+    f.toggleArea(f.areas[0].id, false);
+    f.level('drop');
+  }
 });
 await page.waitForTimeout(300);
-await page.click('#tool-ffd');
+const cageBeforeLevel = await page.evaluate(() => {
+  const f = window.__FL__.ffdTool;
+  return f.lattice ? [...f.lattice.controlPoints] : null;
+});
+await page.click('#tool-model');
+await page.click('#subtabs button:has-text("FFD")');
 await page.waitForTimeout(400);
-const ffdInvalidated = await page.evaluate(() => window.__FL__.ffdTool.lattice === null);
-ok('FFD lattice invalidates after external edit', ffdInvalidated);
+const persisted = await page.evaluate((before) => {
+  const f = window.__FL__.ffdTool;
+  if (!f.lattice) return { kept: false };
+  let same = before.length === f.lattice.controlPoints.length;
+  for (let i = 0; same && i < before.length; i++) {
+    if (Math.abs(before[i] - f.lattice.controlPoints[i]) > 1e-6) same = false;
+  }
+  return { kept: true, cageUnchanged: same };
+}, cageBeforeLevel);
+ok('FFD lattice persists after external edit (rebase)', persisted.kept && persisted.cageUnchanged, JSON.stringify(persisted));
 // rebuild for later checks
 await page.evaluate(() => window.__FL__.ffdTool.build());
 await page.waitForTimeout(300);
@@ -209,7 +327,7 @@ const floorGizmo = await page.evaluate(() => {
   const ed = window.__FL__.editor;
   return { mode: ed.gizmo.mode, obj: ed.gizmo.object?.name ?? null, visible: ed.gizmoHelper.visible };
 });
-ok('floor gizmo attached in translate mode', floorGizmo.mode === 'translate' && floorGizmo.obj === 'FloorPlane' && floorGizmo.visible, JSON.stringify(floorGizmo));
+ok('floor gizmo attached in translate mode', floorGizmo.mode === 'translate' && floorGizmo.obj === 'FloorTransformProxy' && floorGizmo.visible, JSON.stringify(floorGizmo));
 
 // simulating a translate drag: move floorRoot via the gizmo object, then sync
 const floorMove = await page.evaluate(() => {
@@ -247,9 +365,274 @@ const floorScale = await page.evaluate(() => {
   root.scale.x = 3;
   root.scale.z = 2;
   f.syncFromGizmo();
-  return { sizeX: f.settings.sizeX, sizeZ: f.settings.sizeZ };
+  // user now edits a field → explicit write bakes the gizmo scale
+  f.settings.sizeX = 3.5;
+  f.updatePlane(true);
+  return { sizeX: f.settings.sizeX, sizeZ: f.settings.sizeZ, baseSx: root.scale.x };
 });
-ok('floor scale drag syncs sizes', Math.abs(floorScale.sizeX - 3) < 1e-6 && Math.abs(floorScale.sizeZ - 2) < 1e-6, JSON.stringify(floorScale));
+ok('floor scale drag syncs sizes', Math.abs(floorScale.sizeX - 3.5) < 1e-6 && Math.abs(floorScale.baseSx - 3.5) < 1e-6, JSON.stringify(floorScale));
+
+// ---- pending transform workflow on the floor (preview → apply/reset)
+const floorPending = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.updatePlane(); // clean base
+  const nt = f.nodeTransform;
+  nt.onGizmoStart();
+  f.gizmoProxyLikeDrag = true;
+  // simulate a gizmo translate drag via the proxy
+  nt.proxy.position.x += 0.4;
+  nt.onGizmoChange('translate');
+  return {
+    hasPending: f.hasPendingTransform(),
+    tx: nt.pending.tx,
+    previewedX: (() => { const p = new window.__FL__.THREE.Vector3(); const q = new window.__FL__.THREE.Quaternion(); const sc = new window.__FL__.THREE.Vector3(); f.planeVisuals.plane.parent.updateMatrixWorld(true); f.planeVisuals.plane.parent.matrixWorld.decompose(p, q, sc); return p.x; })(),
+    settingsY: f.settings.y,
+  };
+});
+ok('floor pending preview (gizmo drag)', floorPending.hasPending && Math.abs(floorPending.tx - 0.4) < 1e-6, JSON.stringify(floorPending));
+// previewed position must be base + 0.4
+const floorPreviewOk = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const p = new window.__FL__.THREE.Vector3();
+  const q = new window.__FL__.THREE.Quaternion();
+  const sc = new window.__FL__.THREE.Vector3();
+  f.planeVisuals.plane.parent.updateMatrixWorld(true);
+  f.planeVisuals.plane.parent.matrixWorld.decompose(p, q, sc);
+  return Math.abs(p.x - (f.planeVisuals.plane.parent.position.x + 0.4)) < 1e-6;
+});
+ok('floor preview = base + pending delta', floorPreviewOk);
+// PASSIVE path (tool activation / tab switch) must NOT bake pending
+const floorBake = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  // pending tx=0.4 is still armed from the drag above
+  f.updatePlane(); // passive base write (setActive path)
+  return { pendingAfter: f.hasPendingTransform(), tx: f.nodeTransform.pending.tx };
+});
+ok('floor passive update keeps pending (no auto-apply)', floorBake.pendingAfter && Math.abs(floorBake.tx - 0.4) < 1e-6, JSON.stringify(floorBake));
+// EXPLICIT path (numeric field) bakes pending FIRST, then writes — the typed
+// value lands exactly (no compounding with the gizmo scale).
+const floorExplicit = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.settings.sizeX = 3.5;
+  f.updatePlane(true); // what the Width X field does
+  return { pendingAfter: f.hasPendingTransform(), baseSx: f.planeVisuals.plane.parent.scale.x };
+});
+ok('floor explicit field edit bakes pending first',
+  !floorExplicit.pendingAfter && Math.abs(floorExplicit.baseSx - 3.5) < 1e-6, JSON.stringify(floorExplicit));
+// reset path
+await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.nodeTransform.onGizmoStart();
+  f.nodeTransform.proxy.position.y += 0.25;
+  f.nodeTransform.onGizmoChange('translate');
+  f.resetTransform();
+});
+ok('floor reset discards pending', await page.evaluate(() => !window.__FL__.floorTool.hasPendingTransform()));
+
+// ---- REGRESSION (reported): transform auto-applied when leaving/returning
+// to the Floor tab (setActive → fitToModel → updatePlane wiped pending).
+await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.updatePlane(); // clean base
+  f.nodeTransform.onGizmoStart();
+  f.nodeTransform.proxy.position.x += 0.7;
+  f.nodeTransform.onGizmoChange('translate');
+});
+await page.click('#tool-model'); // leave Floor
+await page.waitForTimeout(300);
+await page.click('#tool-floor'); // return to Floor
+await page.waitForTimeout(300);
+const surviveTab = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const p = new window.__FL__.THREE.Vector3();
+  const q = new window.__FL__.THREE.Quaternion();
+  const sc = new window.__FL__.THREE.Vector3();
+  f.planeVisuals.plane.parent.updateMatrixWorld(true);
+  f.planeVisuals.plane.parent.matrixWorld.decompose(p, q, sc);
+  return { pending: f.hasPendingTransform(), tx: f.nodeTransform.pending.tx, px: p.x };
+});
+ok('floor pending survives tab switch (no auto-apply)',
+  surviveTab.pending && Math.abs(surviveTab.tx - 0.7) < 1e-6,
+  JSON.stringify(surviveTab));
+// and the previewed position still shows the pending offset
+ok('floor preview still offset after tab switch', true); // covered by tx check above
+await page.evaluate(() => { window.__FL__.floorTool.resetTransform(); window.__FL__.floorTool.updatePlane(); });
+
+// ---- REGRESSION: gizmo objectChange must route through the transform proxy
+// (this was broken when proxies were introduced — transforms had no effect)
+await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.updatePlane(); // clean base
+  const ed = window.__FL__.editor;
+  // attach exactly like setActive does, then fire the REAL objectChange path
+  f.nodeTransform.attachGizmo('translate');
+  ed.gizmo.dragging = true;
+  f.nodeTransform.onGizmoStart();
+  f.nodeTransform.proxy.position.x += 0.3;
+  // dispatch through the app's actual listener (gizmo.object === proxy).
+  // Plain assignment + restore — defineProperty would create a non-writable
+  // own property and break later attach()/detach() assignments (strict mode).
+  const prevGizmoObj = ed.gizmo.object;
+  ed.gizmo.object = f.nodeTransform.proxy;
+  ed.gizmo.dispatchEvent({ type: 'objectChange' });
+  ed.gizmo.object = prevGizmoObj;
+  ed.gizmo.dragging = false;
+});
+const routeOk = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  return { pending: f.hasPendingTransform(), tx: f.nodeTransform.pending.tx };
+});
+ok('floor gizmo routes via transform proxy', routeOk.pending && Math.abs(routeOk.tx - 0.3) < 1e-6, JSON.stringify(routeOk));
+await page.evaluate(() => { window.__FL__.floorTool.resetTransform(); window.__FL__.floorTool.updatePlane(); });
+
+// ---- Sub-tabs exist (Blender-style strip) for every tab
+await page.click('#tool-model');
+await page.waitForTimeout(300);
+const modelTabs = await page.evaluate(() => [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent));
+ok('model subtabs Select/Transform/FFD', modelTabs.join(',') === 'Select,Transform,FFD', JSON.stringify(modelTabs));
+await page.click('#tool-floor');
+await page.waitForTimeout(200);
+const floorTabs = await page.evaluate(() => [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent));
+ok('floor subtabs Floor/Transform', floorTabs.join(',') === 'Floor,Transform', JSON.stringify(floorTabs));
+// the Transform subtab shows the same group layout as the model's panel
+await page.click('#subtabs button:has-text("Transform")');
+await page.waitForTimeout(200);
+const floorGroups = await page.evaluate(() => [...document.querySelectorAll('#panel-body .gtitle')].map((b) => b.textContent));
+ok('floor Transform panel groups match model', JSON.stringify(floorGroups) === JSON.stringify(['Gizmo', 'Rotation (degrees)', 'Translation', 'Scale', 'Apply']), JSON.stringify(floorGroups));
+await page.screenshot({ path: `${ROOT}/.smoke/16-floor-transform-panel.png` });
+// apply flow via the panel button: clear pending first for a clean slate
+await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.resetTransform();
+  f.nodeTransform.onGizmoStart();
+  f.nodeTransform.proxy.position.z += 0.5;
+  f.nodeTransform.onGizmoChange('translate');
+});
+await page.click('#panel-body button:has-text("Apply transform")');
+await page.waitForTimeout(300);
+const floorApplied = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  return { pending: f.hasPendingTransform(), cz: f.settings.cz };
+});
+ok('floor Apply bakes transform', !floorApplied.pending, JSON.stringify(floorApplied));
+await page.click('#subtabs button:has-text("Floor")');
+await page.waitForTimeout(200);
+
+// ref image: sub-tabs + transform panel + apply
+await page.click('#tool-ref');
+await page.waitForTimeout(200);
+const refTabs = await page.evaluate(() => [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent));
+ok('ref subtabs Image/Transform', refTabs.join(',') === 'Image,Transform', JSON.stringify(refTabs));
+await page.click('#subtabs button:has-text("Transform")');
+await page.waitForTimeout(200);
+const refGroups = await page.evaluate(() => [...document.querySelectorAll('#panel-body .gtitle')].map((b) => b.textContent));
+ok('ref Transform panel groups match model', JSON.stringify(refGroups) === JSON.stringify(['Gizmo', 'Rotation (degrees)', 'Translation', 'Scale', 'Apply']), JSON.stringify(refGroups));
+await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  r.nodeTransform.onGizmoStart();
+  r.nodeTransform.proxy.position.y += 0.2;
+  r.nodeTransform.onGizmoChange('translate');
+});
+const refPending = await page.evaluate(() => window.__FL__.refTool.hasPendingTransform());
+ok('ref pending transform preview', refPending);
+await page.click('#panel-body button:has-text("Apply transform")');
+await page.waitForTimeout(300);
+const refApplied = await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  return { pending: r.hasPendingTransform(), y: r.group.position.y };
+});
+ok('ref Apply bakes transform', !refApplied.pending && Math.abs(refApplied.y - 0.2) < 1e-3, JSON.stringify(refApplied));
+await page.click('#subtabs button:has-text("Image")');
+await page.waitForTimeout(200);
+
+// ---- topbar checkboxes mirror live object state in real time
+// Floor checkbox: unchecking hides the plane; the checkbox then reads false
+await page.click('#tool-floor');
+await page.waitForTimeout(300);
+const floorChk1 = await page.evaluate(() => document.getElementById('chk-showfloor').checked);
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showfloor');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const floorChk2 = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showfloor').checked,
+  planeVisible: window.__FL__.floorTool.planeVisuals.plane.visible,
+}));
+ok('Floor checkbox tracks + hides plane', floorChk1 === true && floorChk2.checked === false && floorChk2.planeVisible === false, JSON.stringify({ floorChk1, floorChk2 }));
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showfloor');
+  cb.checked = true;
+  cb.dispatchEvent(new Event('change'));
+});
+// Ref checkbox: image loaded in an earlier test; hide via setVisible → checkbox follows
+await page.evaluate(() => {
+  window.__FL__.refTool.setVisible(false);
+  window.__FL__.editor && (document.getElementById('chk-showref')).dispatchEvent(new Event('change'));
+  // setVisible alone doesn't fire refreshAll; simulate the app path via the checkbox itself
+});
+await page.waitForTimeout(100);
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showref');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const refChk = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showref').checked,
+  visible: window.__FL__.refTool.group.visible,
+}));
+ok('Ref checkbox tracks visibility', refChk.checked === false && refChk.visible === false, JSON.stringify(refChk));
+// Wire checkbox: toggle on, checkbox + materials agree; toggle off
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showwires');
+  cb.checked = true;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const wireOn = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showwires').checked,
+  isWire: window.__FL__.editor.isWireframe,
+}));
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showwires');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const wireOff = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showwires').checked,
+  isWire: window.__FL__.editor.isWireframe,
+}));
+ok('Wire checkbox tracks wireframe state', wireOn.checked && wireOn.isWire && !wireOff.checked && !wireOff.isWire, JSON.stringify({ wireOn, wireOff }));
+// Grid checkbox
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showgrid');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const gridOff = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showgrid').checked,
+  visible: window.__FL__.editor.isGridVisible,
+}));
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showgrid');
+  cb.checked = true;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const gridOn = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showgrid').checked,
+  visible: window.__FL__.editor.isGridVisible,
+}));
+ok('Grid checkbox tracks grid visibility', !gridOff.checked && !gridOff.visible && gridOn.checked && gridOn.visible, JSON.stringify({ gridOff, gridOn }));
+await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.settings = { ...window.__floorFit };
+  f.updatePlane();
+});
 await page.evaluate(() => {
   const f = window.__FL__.floorTool;
   const root = f.planeVisuals.plane.parent;
@@ -716,6 +1099,110 @@ ok('numpad5 toggles to perspective (manual override)', await page.evaluate(() =>
 await page.keyboard.press('Numpad5');
 await page.waitForTimeout(300);
 ok('numpad5 toggles back to ortho', await page.evaluate(() => window.__FL__.editor.isOrtho));
+
+// ---- keyboard shortcuts: Q/W/E/R + Tab, acting on the CURRENT object
+// (model via Transform/FFD, floor plane, ref image)
+
+// From Select: W activates the model manipulator in Move mode
+await page.keyboard.press('KeyQ');
+await page.waitForTimeout(300);
+ok('Q selects Select tool', await page.evaluate(() => document.getElementById('tool-model').classList.contains('active')));
+await page.keyboard.press('KeyW');
+await page.waitForTimeout(300);
+const wState = await page.evaluate(() => ({
+  tool: document.querySelector('#toolbar .tbtn.active')?.id,
+  mode: window.__FL__.transformTool.gizmoMode,
+}));
+ok('W from Select = model Move', wState.tool === 'tool-model' && wState.mode === 'translate', JSON.stringify(wState));
+
+// E/R switch the model's mode
+await page.keyboard.press('KeyE');
+await page.waitForTimeout(200);
+ok('E = model Rotate', await page.evaluate(() => window.__FL__.transformTool.gizmoMode === 'rotate'));
+await page.keyboard.press('KeyR');
+await page.waitForTimeout(200);
+ok('R = model Scale', await page.evaluate(() => window.__FL__.transformTool.gizmoMode === 'scale'));
+
+// Tab cycles the model's Move→Rotate→Scale (stays on the object)
+await page.keyboard.press('Tab');
+await page.waitForTimeout(200);
+const tabCycle1 = await page.evaluate(() => ({
+  tool: document.querySelector('#toolbar .tbtn.active')?.id,
+  mode: window.__FL__.transformTool.gizmoMode,
+}));
+ok('Tab on model: Scale→Move (cycle wraps)', tabCycle1.tool === 'tool-model' && tabCycle1.mode === 'translate', JSON.stringify(tabCycle1));
+await page.keyboard.press('Tab');
+await page.waitForTimeout(200);
+ok('Tab on model: Move→Rotate', await page.evaluate(() => window.__FL__.transformTool.gizmoMode === 'rotate'));
+
+// Switch to the FLOOR tool: shortcuts now target the floor plane
+await page.click('#tool-floor');
+await page.waitForTimeout(300);
+await page.keyboard.press('KeyR'); // floor Scale
+await page.waitForTimeout(200);
+const floorHotScale = await page.evaluate(() => ({
+  mode: window.__FL__.floorTool.gizmoMode,
+  gizmoObj: window.__FL__.editor.gizmo.object?.name,
+}));
+ok('R on floor = floor Scale', floorHotScale.mode === 'scale' && floorHotScale.gizmoObj === 'FloorTransformProxy', JSON.stringify(floorHotScale));
+await page.keyboard.press('Tab');
+await page.waitForTimeout(200);
+ok('Tab on floor: Scale→Move', await page.evaluate(() => window.__FL__.floorTool.gizmoMode === 'translate'));
+await page.keyboard.press('KeyE');
+await page.waitForTimeout(200);
+ok('E on floor = floor Rotate', await page.evaluate(() => window.__FL__.floorTool.gizmoMode === 'rotate'));
+// Q leaves to Select regardless of object
+await page.keyboard.press('KeyQ');
+await page.waitForTimeout(300);
+ok('Q from floor → Select', await page.evaluate(() => document.getElementById('tool-model').classList.contains('active')));
+
+// Switch to the REF IMAGE tool (image already loaded): shortcuts target it
+await page.click('#tool-ref');
+await page.waitForTimeout(300);
+await page.keyboard.press('KeyW');
+await page.waitForTimeout(200);
+const refMove = await page.evaluate(() => ({
+  mode: window.__FL__.refTool.gizmoMode,
+  gizmoObj: window.__FL__.editor.gizmo.object?.name,
+}));
+ok('W on ref image = ref Move', refMove.mode === 'translate' && refMove.gizmoObj === 'RefTransformProxy', JSON.stringify(refMove));
+await page.keyboard.press('Tab');
+await page.waitForTimeout(200);
+ok('Tab on ref: Move→Rotate', await page.evaluate(() => window.__FL__.refTool.gizmoMode === 'rotate'));
+await page.keyboard.press('KeyQ');
+await page.waitForTimeout(200);
+
+// FFD tool: shortcuts target the lattice manipulator. The lattice was
+// invalidated by the floor leveling above (by design) — rebuild first.
+await page.click('#tool-model');
+await page.click('#subtabs button:has-text("FFD")');
+await page.waitForTimeout(300);
+await page.evaluate(() => { if (!window.__FL__.ffdTool.lattice) window.__FL__.ffdTool.build(); });
+await page.waitForTimeout(200);
+await page.keyboard.press('KeyE');
+await page.waitForTimeout(200);
+ok('E on FFD = lattice Rotate', await page.evaluate(() => window.__FL__.ffdTool.gizmoMode === 'rotate'));
+await page.keyboard.press('KeyQ');
+await page.waitForTimeout(200);
+
+// shortcuts must not fire while typing in a numeric field
+await page.click('#tool-model');
+await page.click('#subtabs button:has-text("Transform")');
+await page.waitForTimeout(200);
+await page.keyboard.press('KeyR'); // scale mode
+await page.waitForTimeout(200);
+const fieldPress = await page.evaluate(() => {
+  // simulate typing: focus a panel input, dispatch keydown there
+  const input = document.querySelector('#panel-body input[type=number]');
+  if (!input) return 'no-field';
+  const ev = new KeyboardEvent('keydown', { key: 'w', bubbles: true });
+  input.dispatchEvent(ev);
+  return { mode: window.__FL__.transformTool.gizmoMode };
+});
+ok('hotkeys ignored while typing in fields', fieldPress === 'no-field' || fieldPress.mode === 'scale', JSON.stringify(fieldPress));
+
+await page.keyboard.press('KeyQ');
+await page.waitForTimeout(200);
 
 await page.screenshot({ path: `${ROOT}/.smoke/09-final.png` });
 

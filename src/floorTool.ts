@@ -5,6 +5,7 @@ import { intersectFloorPlane, dropToPlane, flattenToPlane, type FloorFrame } fro
 import { selectionFalloff, weldedVertexWeights } from './falloff';
 import { getAdjacency } from './falloff';
 import { makeTextSprite } from './editor';
+import { PendingNodeTransform } from './objectTransform';
 import type { History } from './history';
 
 /**
@@ -30,6 +31,8 @@ export class FloorTool {
   /** UI visibility toggle (topbar checkbox). */
   uiVisible = true;
   lastScanMeshUuid = '';
+  /** Auto-fit runs once per model (placement persists across tab switches). */
+  private autoFitPending = true;
 
   private editor: Editor;
   private history: History;
@@ -40,6 +43,13 @@ export class FloorTool {
   private floorRoot: THREE.Group;
   private planeMesh: THREE.Mesh;
   private outline: THREE.LineSegments;
+
+  /**
+   * Pending node transform (preview → Apply bakes → Reset discards), exactly
+   * like the model's Transform tool. Gizmo drags fold into pending; leveling
+   * reads the PREVIEWED frame so what you see is what gets leveled.
+   */
+  readonly nodeTransform: PendingNodeTransform;
 
   /** Plane visuals for the topbar visibility toggle. */
   get planeVisuals(): { plane: THREE.Mesh; outline: THREE.LineSegments } {
@@ -59,6 +69,8 @@ export class FloorTool {
     this.floorRoot = new THREE.Group();
     this.floorRoot.name = 'FloorPlane';
     this.editor.overlayGroup.add(this.floorRoot);
+    this.nodeTransform = new PendingNodeTransform(editor, history, onChanged, 'FloorTransformProxy');
+    this.nodeTransform.setTarget(this.floorRoot);
 
     const planeMat = new THREE.MeshBasicMaterial({
       color: 0x2fb9b9,
@@ -101,8 +113,13 @@ export class FloorTool {
       this.areas = [];
       this.selectedIds.clear();
     } else {
-      this.fitToModel();
-      this.editor.attachGizmo(this.floorRoot, this.gizmoMode, 'world');
+      // Auto-fit only on the first activation per model — afterwards the
+      // user's placement persists until they change it or import anew.
+      if (this.autoFitPending) {
+        this.fitToModel();
+        this.autoFitPending = false;
+      }
+      this.nodeTransform.attachGizmo(this.gizmoMode);
       this.editor.gizmo.showY = this.gizmoMode !== 'scale';
     }
     this.updatePlane();
@@ -111,14 +128,52 @@ export class FloorTool {
 
   setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
     this.gizmoMode = mode;
-    if (this.active) this.editor.attachGizmo(this.floorRoot, mode, 'world');
+    if (this.active) this.nodeTransform.attachGizmo(mode);
     // Scale mode: the plane has no world-Y extent, so the Y-scale handle is
     // meaningless — hide it (translate/rotate need all axes).
     this.editor.gizmo.showY = mode !== 'scale';
   }
 
+  /** Pending transform of the floor node (live during gizmo drags). */
+  get pendingTransform() {
+    return this.nodeTransform.pending;
+  }
+
+  hasPendingTransform(): boolean {
+    return this.nodeTransform.hasPending;
+  }
+
+  /** Bake the pending transform into the floor node (undoable). */
+  applyTransform(): boolean {
+    const ok = this.nodeTransform.apply();
+    if (ok) {
+      this.syncFromGizmo();
+      this.onChanged();
+    }
+    return ok;
+  }
+
+  /** Discard the pending transform (floor returns to its baked state). */
+  resetTransform(): void {
+    this.nodeTransform.reset();
+    this.syncFromGizmo();
+    this.onChanged();
+  }
+
   /** Rotation of the plane in degrees (Euler XYZ), e.g. tilt/spin fields. */
   get rotationDeg(): { x: number; y: number; z: number } {
+    // Read the previewed orientation (pending rides on the node matrix).
+    if (this.hasPendingTransform()) {
+      this.floorRoot.updateMatrixWorld(true);
+      const q = new THREE.Quaternion();
+      this.floorRoot.matrixWorld.decompose(new THREE.Vector3(), q, new THREE.Vector3());
+      const e = new THREE.Euler().setFromQuaternion(q, 'XYZ');
+      return {
+        x: THREE.MathUtils.radToDeg(e.x),
+        y: THREE.MathUtils.radToDeg(e.y),
+        z: THREE.MathUtils.radToDeg(e.z),
+      };
+    }
     return {
       x: THREE.MathUtils.radToDeg(this.floorRoot.rotation.x),
       y: THREE.MathUtils.radToDeg(this.floorRoot.rotation.y),
@@ -140,14 +195,33 @@ export class FloorTool {
    */
   syncFromGizmo(): void {
     const s = this.settings;
-    s.cx = this.floorRoot.position.x;
-    s.y = this.floorRoot.position.y;
-    s.cz = this.floorRoot.position.z;
-    s.sizeX = Math.max(0.05, this.floorRoot.scale.x);
-    s.sizeZ = Math.max(0.05, this.floorRoot.scale.z);
-    this.floorRoot.scale.x = s.sizeX;
-    this.floorRoot.scale.z = s.sizeZ;
+    let pos: THREE.Vector3;
+    let scale: THREE.Vector3;
+    if (this.hasPendingTransform()) {
+      // Pending active: the node's TRS holds the baked base while its matrix
+      // holds base∘pending — read the previewed world matrix.
+      this.floorRoot.updateMatrixWorld(true);
+      const q = new THREE.Quaternion();
+      pos = new THREE.Vector3();
+      scale = new THREE.Vector3();
+      this.floorRoot.matrixWorld.decompose(pos, q, scale);
+    } else {
+      // No pending: TRS is authoritative (matrix may be stale after direct
+      // TRS writes — e.g. tests or fitToModel — without updateMatrix).
+      pos = this.floorRoot.position;
+      scale = this.floorRoot.scale;
+    }
+    s.cx = pos.x;
+    s.y = pos.y;
+    s.cz = pos.z;
+    s.sizeX = Math.max(0.05, Math.abs(scale.x));
+    s.sizeZ = Math.max(0.05, Math.abs(scale.z));
     this.positionLabel();
+  }
+
+  /** Re-arm the one-time auto-fit (call on model import / mesh switch). */
+  armAutoFit(): void {
+    this.autoFitPending = true;
   }
 
   /** Center + size the plane to the model bbox footprint (convenience). */
@@ -165,10 +239,28 @@ export class FloorTool {
     this.updatePlane();
   }
 
-  updatePlane(): void {
+  /**
+   * Write the settings-defined geometry into the BAKED base.
+   * bakePending=true for EXPLICIT user input (numeric fields, Fit, @bottom):
+   * the pending gizmo transform is folded in first so the written values are
+   * exactly what the user typed. Passive paths (tool activation) pass false —
+   * pending must survive those untouched.
+   */
+  updatePlane(bakePending = false): void {
     const s = this.settings;
+    if (bakePending && this.hasPendingTransform()) {
+      this.nodeTransform.apply();
+    }
+    if (this.hasPendingTransform()) {
+      // Pending active and not baking: only the LABEL follows the preview;
+      // the base TRS must not be touched (pending rides on top).
+      this.positionLabel();
+      this.floorRoot.updateMatrixWorld(true);
+      return;
+    }
     this.floorRoot.position.set(s.cx, s.y, s.cz);
     this.floorRoot.scale.set(s.sizeX, 1, s.sizeZ);
+    this.nodeTransform.refreshBase();
     this.positionLabel();
     this.floorRoot.updateMatrixWorld(true);
   }

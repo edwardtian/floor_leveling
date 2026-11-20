@@ -32,8 +32,8 @@ export class FFDTool {
 
   /** Vertex (u,v,w) params captured when the lattice was built. */
   private local: Float32Array | null = null;
-  /** Vertex positions at lattice build time — deform always evaluates from these. */
-  private restPositions: Float32Array | null = null;
+  /** Mesh positions when the lattice was (re)based — deform applies ON TOP of these. */
+  private basePositions: Float32Array | null = null;
   /** Cheap identity of the mesh state at build time (stale-detection). */
   private buildChecksum = '';
 
@@ -75,8 +75,8 @@ export class FFDTool {
 
     this.lattice = new FFDLattice(bb, this.settings.nx, this.settings.ny, this.settings.nz);
     const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
-    this.restPositions = new Float32Array(pos.array as Float32Array);
-    this.local = FFDLattice.localCoordsFor(this.restPositions, bb);
+    this.basePositions = new Float32Array(pos.array as Float32Array);
+    this.local = FFDLattice.localCoordsFor(this.basePositions, bb);
     this.buildChecksum = this.meshChecksum();
     this.selected.clear();
     this.gizmoProxy.position.set(0, 0, 0);
@@ -88,7 +88,7 @@ export class FFDTool {
     return true;
   }
 
-  /** Reset control points to the rest cage (mesh returns to build shape). */
+  /** Reset control points to the rest cage (mesh returns to its base shape). */
   reset(): void {
     const mesh = this.getMesh();
     if (!mesh || !this.lattice) return;
@@ -100,22 +100,20 @@ export class FFDTool {
     this.syncVisuals();
     const after = new Float32Array(pos.array as Float32Array);
     const cageAfter = new Float32Array(this.lattice.controlPoints);
-    const local = this.local!;
     const undo = () => {
       (pos.array as Float32Array).set(before);
-      this.lattice!.controlPoints.set(cageBefore);
-      this.lattice!.deform(local, pos.array as Float32Array);
       pos.needsUpdate = true;
       mesh.geometry.computeBoundingBox();
       mesh.geometry.computeBoundingSphere();
+      this.lattice!.controlPoints.set(cageBefore);
       this.syncVisuals();
     };
     const redo = () => {
       (pos.array as Float32Array).set(after);
-      this.lattice!.controlPoints.set(cageAfter);
       pos.needsUpdate = true;
       mesh.geometry.computeBoundingBox();
       mesh.geometry.computeBoundingSphere();
+      this.lattice!.controlPoints.set(cageAfter);
       this.syncVisuals();
     };
     this.history.push({ name: 'Reset lattice', undo, redo });
@@ -126,7 +124,7 @@ export class FFDTool {
   collapse(): void {
     this.lattice = null;
     this.local = null;
-    this.restPositions = null;
+    this.basePositions = null;
     this.selected.clear();
     this.disposeVisuals();
     this.editor.detachGizmo();
@@ -135,16 +133,48 @@ export class FFDTool {
 
   /**
    * Called when another tool edits mesh vertices (floor leveling, transform
-   * apply, model import/switch): the captured rest state is stale, so the
-   * cage is dropped — like collapsing the modifier in Max.
+   * apply, undo/redo): REBASE the deformation — the current mesh becomes the
+   * new base and the cage keeps its position and shape, so the FFD effect
+   * persists on top of the new base. Like Max keeping the modifier live.
+   */
+  rebase(): void {
+    const mesh = this.getMesh();
+    if (!mesh || !this.lattice || !this.local || !this.basePositions) return;
+    const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const current = pos.array as Float32Array;
+
+    // Deformed positions under the CURRENT cage (what FFD contributed):
+    const ffdOut = new Float32Array(current.length);
+    this.lattice.deform(this.local, ffdOut);
+
+    // New base = current − (deformed − base)  →  current mesh is FFD-neutral.
+    const newBase = new Float32Array(current.length);
+    for (let i = 0; i < current.length; i++) {
+      newBase[i] = current[i] - (ffdOut[i] - this.basePositions[i]);
+    }
+
+    // Re-derive (u,v,w) from the new base under the same lattice box.
+    this.basePositions = newBase;
+    this.local = FFDLattice.localCoordsFor(newBase, this.lattice.box);
+    this.buildChecksum = this.meshChecksum();
+  }
+
+  /**
+   * Legacy alias kept for call sites that expect the old drop-the-cage
+   * behavior (model import / mesh switch — there the cage IS meaningless).
    */
   invalidate(): void {
-    if (this.lattice) this.collapse();
+    this.collapse();
   }
 
   // ---------- deformation ----------
 
-  /** Re-evaluate the mesh surface from rest positions + current cage. */
+  /**
+   * Re-evaluate the mesh surface: out = F_current(local).
+   * The rest cage evaluates to exactly min + local·size (the box grid), i.e.
+   * the base itself, so direct evaluation already IS "base + delta".
+   * basePositions/local are kept for rebase() after external edits.
+   */
   private applyDeform(): void {
     const mesh = this.getMesh();
     if (!mesh || !this.lattice || !this.local) return;
@@ -275,13 +305,20 @@ export class FFDTool {
     if (!lat || !this.pointsMesh) return [];
     const w = this.editor.size.width;
     const h = this.editor.size.height;
+    // The rect arrives in NDC (from editor.endRect) — convert to CSS pixels,
+    // flipping Y (NDC bottom-up → pixel top-down).
+    const px0 = ((rect.x0 + 1) / 2) * w;
+    const px1 = ((rect.x1 + 1) / 2) * w;
+    const py0 = ((1 - rect.y1) / 2) * h;
+    const py1 = ((1 - rect.y0) / 2) * h;
     const v = new THREE.Vector3();
     const ids: number[] = [];
     for (let i = 0; i < lat.count; i++) {
       v.set(lat.controlPoints[i * 3], lat.controlPoints[i * 3 + 1], lat.controlPoints[i * 3 + 2]).project(this.editor.camera);
+      if (v.z > 1) continue; // behind the camera
       const x = ((v.x + 1) / 2) * w;
       const y = ((1 - v.y) / 2) * h;
-      if (x >= rect.x0 && x <= rect.x1 && y >= rect.y0 && y <= rect.y1) ids.push(i);
+      if (x >= px0 && x <= px1 && y >= py0 && y <= py1) ids.push(i);
     }
     return ids;
   }
@@ -416,7 +453,6 @@ export class FFDTool {
       const before = pendingBefore;
       const cageBefore = new Float32Array(this.dragStartCage);
       const cageAfter = new Float32Array(this.lattice.controlPoints);
-      const local = this.local!;
       const undo = () => {
         (pos.array as Float32Array).set(before);
         pos.needsUpdate = true;
@@ -428,10 +464,7 @@ export class FFDTool {
       };
       const redo = () => {
         this.lattice!.controlPoints.set(cageAfter);
-        this.lattice!.deform(local, pos.array as Float32Array);
-        pos.needsUpdate = true;
-        mesh.geometry.computeBoundingBox();
-        mesh.geometry.computeBoundingSphere();
+        this.applyDeform();
         this.syncVisuals();
       };
       this.history.push({ name: `FFD ${this.dragMode}`, undo, redo });
@@ -450,12 +483,11 @@ export class FFDTool {
   setActive(v: boolean): void {
     this.active = v;
     if (v) {
-      // Another tool may have edited vertices since the lattice was built
-      // (transform apply, floor leveling, undo/redo) — detect and drop.
+      // Another tool may have edited vertices since the last FFD evaluation
+      // (floor leveling, transform apply, undo/redo): REBASE the delta so the
+      // lattice and its position persist (until Reset or a new model).
       if (this.lattice && this.buildChecksum !== this.meshChecksum()) {
-        this.collapse();
-        this.onChanged();
-        return;
+        this.rebase();
       }
       if (this.lattice) {
         this.ensureVisuals();

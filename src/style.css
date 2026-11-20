@@ -35,13 +35,34 @@ body {
 #panel {
   position: absolute; top: 44px; right: 0; width: 275px; bottom: 0;
   background: rgba(30, 32, 36, 0.96); border-left: 1px solid var(--border);
-  display: flex; flex-direction: column; z-index: 20;
+  display: grid; grid-template-columns: 1fr 28px; grid-template-rows: auto 1fr;
+  z-index: 20;
 }
+/* Floor/Ref have no sub-tabs: the strip column collapses. */
+#panel[data-subtabs='0'] { grid-template-columns: 1fr; }
 #panel-title {
+  grid-column: 1; grid-row: 1;
   padding: 9px 12px; font-weight: 600; border-bottom: 1px solid var(--border);
   background: var(--bg3);
 }
-#panel-body { padding: 10px 12px; overflow-y: auto; flex: 1; }
+/* Blender-style vertical tab strip on the panel's right edge. */
+#subtabs {
+  grid-column: 2; grid-row: 1 / 3;
+  display: flex; flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg2);
+}
+#subtabs button {
+  background: var(--bg2); color: var(--fg-dim); border: none;
+  border-bottom: 1px solid var(--border);
+  padding: 12px 0; cursor: pointer; font-size: 11px;
+  writing-mode: vertical-rl; text-orientation: mixed;
+  letter-spacing: 0.5px;
+}
+#subtabs button:last-child { border-bottom: none; }
+#subtabs button:hover { background: var(--bg3); color: var(--fg); }
+#subtabs button.active { background: var(--bg3); color: #fff; }
+#panel-body { grid-column: 1; grid-row: 2; padding: 10px 12px; overflow-y: auto; }
 
 .btn {
   background: var(--bg3); color: var(--fg); border: 1px solid var(--border);

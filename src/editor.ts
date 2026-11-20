@@ -476,6 +476,24 @@ export class Editor {
     this.orbit.enabled = v;
   }
 
+  /** Current wireframe flag (for the topbar checkbox sync). */
+  get isWireframe(): boolean {
+    let wire = false;
+    this.modelRoot.traverse((o) => {
+      if (wire) return; // first mesh wins
+      const mesh = o as THREE.Mesh;
+      if (mesh.isMesh && !Array.isArray(mesh.material) && mesh.material) {
+        wire = (mesh.material as THREE.MeshStandardMaterial).wireframe;
+      }
+    });
+    return wire;
+  }
+
+  /** Current grid visibility (for the topbar checkbox sync). */
+  get isGridVisible(): boolean {
+    return this.gridVisible;
+  }
+
   setWireframe(v: boolean): void {
     this.modelRoot.traverse((o) => {
       const mesh = o as THREE.Mesh;

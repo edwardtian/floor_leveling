@@ -25,7 +25,6 @@ const editor = new Editor(viewport);
 
 let meshes: MeshData[] = [];
 let activeMeshIndex = 0;
-let currentTool: ToolId = 'select';
 let units: MeasurementUnits = 'meter';
 let importedFileName = '';
 let unitRefreshers: (() => void)[] = [];
@@ -35,23 +34,34 @@ let floorTransformSyncers: (() => void)[] = [];
 const transformTool = new TransformTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
 const ffdTool = new FFDTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
 const floorTool = new FloorTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
-const refTool = new RefTool(editor, refreshAll);
+const refTool = new RefTool(editor, history, refreshAll);
 
 editor.addGizmoDragStartListener(() => {
-  if (currentTool === 'ffd') ffdTool.beginGizmoDrag();
+  if (activeModelSub() === 'ffd') ffdTool.beginGizmoDrag();
+  if (currentTool === 'floor') floorTool.nodeTransform.onGizmoStart();
+  if (currentTool === 'ref') refTool.nodeTransform.onGizmoStart();
 });
 editor.addGizmoDragEndListener(() => {
-  if (currentTool === 'ffd') ffdTool.endGizmoDrag();
-  if (currentTool === 'floor') floorTool.syncFromGizmo(); // clamp scale, mirror settings
-  if (currentTool === 'transform') return; // TransformTool has its own listener
+  if (activeModelSub() === 'ffd') ffdTool.endGizmoDrag();
+  if (currentTool === 'floor') {
+    floorTool.syncFromGizmo(); // clamp scale, mirror settings
+    refreshFloorTransformFields();
+    buildPanel(); // refresh pending hint / Apply state
+  }
+  if (currentTool === 'ref') buildPanel(); // re-seat fields + pending hint
 });
 editor.gizmo.addEventListener('objectChange', () => {
-  if (currentTool === 'ffd' && ffdTool.handlesGizmo(editor.gizmo.object as THREE.Object3D)) {
+  const gizmoObj = editor.gizmo.object as THREE.Object3D;
+  if (activeModelSub() === 'ffd' && ffdTool.handlesGizmo(gizmoObj)) {
     ffdTool.updateGizmoDrag();
   }
-  if (currentTool === 'floor' && editor.gizmo.object === floorTool.planeVisuals.plane.parent) {
+  if (currentTool === 'floor' && gizmoObj === floorTool.nodeTransform.proxy) {
+    floorTool.nodeTransform.onGizmoChange(floorTool.gizmoMode); // fold into pending + preview
     floorTool.syncFromGizmo(); // live-update numeric fields during the drag
     for (const fn of floorTransformSyncers) fn();
+  }
+  if (currentTool === 'ref' && gizmoObj === refTool.nodeTransform.proxy) {
+    refTool.nodeTransform.onGizmoChange(refTool.gizmoMode);
   }
 });
 
@@ -96,6 +106,7 @@ async function importFromFile(file: File): Promise<void> {
     floorTool.clearHitOverlay();
     floorTool.areas = [];
     floorTool.selectedIds.clear();
+    floorTool.armAutoFit(); // new model → re-arm the one-time auto-fit
     const res = await importModel(file);
     meshes = res.meshes;
     activeMeshIndex = 0;
@@ -179,27 +190,85 @@ async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
 
 // ---------- tool switching ----------
 
+/**
+ * Top-level object tabs: Model, Floor, Ref Image.
+ * The Model tab hosts vertical sub-panels: Select / Transform / FFD.
+ */
+type ObjectTab = 'model' | 'floor' | 'ref';
+type ModelSub = 'select' | 'transform' | 'ffd';
+/** Sub-panels inside the Floor / Ref Image tabs. */
+type FloorSub = 'floor' | 'transform';
+type RefSub = 'image' | 'transform';
+let floorSub: FloorSub = 'floor';
+let refSub: RefSub = 'image';
+
+let currentTool: ObjectTab = 'model';
+let modelSub: ModelSub = 'select';
+
+/** Which model sub-tool is active right now (for gizmo routing etc.). */
+function activeModelSub(): ModelSub | null {
+  return currentTool === 'model' ? modelSub : null;
+}
+
 function setTool(id: ToolId): void {
-  currentTool = id;
+  // ToolId now carries either an object tab or a model sub-panel.
+  if (id === 'select' || id === 'transform' || id === 'ffd') {
+    currentTool = 'model';
+    modelSub = id;
+  } else {
+    currentTool = id;
+  }
+  applyToolState();
+}
 
-  transformTool.setActive(id === 'transform');
-  ffdTool.setActive(id === 'ffd');
-  floorTool.setActive(id === 'floor');
-  refTool.setActive(id === 'ref');
+function applyToolState(): void {
+  const sub = activeModelSub();
 
-  // Left-drag meaning per tool.
-  editor.setLeftButtonOrbit(id === 'select' || id === 'transform' || id === 'ref');
-  if (id !== 'transform' && id !== 'ref' && id !== 'floor' && id !== 'ffd') editor.detachGizmo();
+  transformTool.setActive(!!sub && sub === 'transform');
+  ffdTool.setActive(!!sub && sub === 'ffd');
+  floorTool.setActive(currentTool === 'floor');
+  refTool.setActive(currentTool === 'ref');
 
-  for (const [toolId, btnId] of [
-    ['select', 'tool-select'],
-    ['transform', 'tool-transform'],
-    ['ffd', 'tool-ffd'],
+  // Left-drag meaning: rect-select/FFD picking need it; orbit for the rest.
+  editor.setLeftButtonOrbit(!sub || sub === 'select' || currentTool === 'ref');
+  if (sub === 'select') editor.detachGizmo();
+  if (!sub && currentTool !== 'floor' && currentTool !== 'ref') editor.detachGizmo();
+
+  // Topbar tabs.
+  for (const [tabId, btnId] of [
+    ['model', 'tool-model'],
     ['floor', 'tool-floor'],
     ['ref', 'tool-ref'],
   ] as const) {
-    document.getElementById(btnId)!.classList.toggle('active', toolId === id);
+    document.getElementById(btnId)!.classList.toggle('active', tabId === currentTool);
   }
+  // Panel title + vertical Blender-style tab strip on the right edge.
+  const title = currentTool === 'model' ? 'Model' : currentTool === 'floor' ? 'Floor' : 'Reference image';
+  panelTitle.textContent = title;
+  const panel = document.getElementById('panel')!;
+  const subtabs = document.getElementById('subtabs')!;
+  subtabs.innerHTML = '';
+  let count = 0;
+  const addSub = (label: string, active: boolean, onPick: () => void) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.classList.toggle('active', active);
+    b.addEventListener('click', onPick);
+    subtabs.appendChild(b);
+    count++;
+  };
+  if (currentTool === 'model') {
+    for (const s of ['select', 'transform', 'ffd'] as const) {
+      addSub(s === 'ffd' ? 'FFD' : s[0].toUpperCase() + s.slice(1), s === modelSub, () => setTool(s));
+    }
+  } else if (currentTool === 'floor') {
+    addSub('Floor', floorSub === 'floor', () => { floorSub = 'floor'; applyToolState(); });
+    addSub('Transform', floorSub === 'transform', () => { floorSub = 'transform'; applyToolState(); });
+  } else {
+    addSub('Image', refSub === 'image', () => { refSub = 'image'; applyToolState(); });
+    addSub('Transform', refSub === 'transform', () => { refSub = 'transform'; applyToolState(); });
+  }
+  panel.dataset.subtabs = String(count);
   buildPanel();
 }
 
@@ -212,13 +281,11 @@ function setTool(id: ToolId): void {
 (document.getElementById('btn-redo') as HTMLButtonElement).addEventListener('click', () => doRedo());
 
 for (const [toolId, btnId] of [
-  ['select', 'tool-select'],
-  ['transform', 'tool-transform'],
-  ['ffd', 'tool-ffd'],
+  ['model', 'tool-model'],
   ['floor', 'tool-floor'],
   ['ref', 'tool-ref'],
 ] as const) {
-  document.getElementById(btnId)!.addEventListener('click', () => setTool(toolId));
+  document.getElementById(btnId)!.addEventListener('click', () => setTool(toolId as ToolId));
 }
 
 (document.getElementById('chk-showfloor') as HTMLInputElement).addEventListener('change', (e) => {
@@ -226,9 +293,11 @@ for (const [toolId, btnId] of [
   floorTool.uiVisible = v;
   floorTool.planeVisuals.plane.visible = v && floorTool.active;
   floorTool.planeVisuals.outline.visible = v && floorTool.active;
+  refreshAll(); // checkbox state re-derived from objects
 });
 (document.getElementById('chk-showref') as HTMLInputElement).addEventListener('change', (e) => {
   refTool.setVisible((e.target as HTMLInputElement).checked);
+  refreshAll();
 });
 (document.getElementById('chk-showwires') as HTMLInputElement).addEventListener('change', (e) => {
   editor.setWireframe((e.target as HTMLInputElement).checked);
@@ -236,6 +305,19 @@ for (const [toolId, btnId] of [
 (document.getElementById('chk-showgrid') as HTMLInputElement).addEventListener('change', (e) => {
   editor.setGridVisible((e.target as HTMLInputElement).checked);
 });
+
+/**
+ * Mirror the topbar checkboxes to the live object state: Floor visible =
+ * plane shown (tool active + uiVisible), Ref = image loaded AND shown,
+ * Wire/Grid from the editor. Called on every refreshAll.
+ */
+function syncTopbarChecks(): void {
+  const floor = floorTool.uiVisible && floorTool.active;
+  (document.getElementById('chk-showfloor') as HTMLInputElement).checked = floor;
+  (document.getElementById('chk-showref') as HTMLInputElement).checked = refTool.hasImage && refTool.group.visible;
+  (document.getElementById('chk-showwires') as HTMLInputElement).checked = editor.isWireframe;
+  (document.getElementById('chk-showgrid') as HTMLInputElement).checked = editor.isGridVisible;
+}
 
 function doUndo(): void {
   const cmd = history.undo();
@@ -256,11 +338,118 @@ function doRedo(): void {
 }
 
 function afterHistoryJump(label: string): void {
+  // Undo/redo rewrites mesh vertices: rebase the FFD delta (or drop if the
+  // jump crossed a lattice build/reset — rebase detects shape mismatch only
+  // roughly, so a plain rebase keeps the cage and accepts the new base).
+  ffdTool.rebase();
   ffdTool.repaint();
   if (floorTool.active && floorTool.areas.length) floorTool.scan();
   transformTool.preview();
   refreshAll();
   toast(label);
+}
+
+// ---------- keyboard shortcuts (3ds Max style) ----------
+
+/** The manipulator of the currently active object (model / floor / ref image). */
+interface ManipulatorCtx {
+  getMode: () => 'translate' | 'rotate' | 'scale';
+  setMode: (m: 'translate' | 'rotate' | 'scale') => void;
+  /** Object label for toasts. */
+  label: string;
+  /** Whether the manipulator can actually act right now. */
+  ready: boolean;
+}
+
+function manipulatorCtx(): ManipulatorCtx | null {
+  if (currentTool === 'floor') {
+    return {
+      getMode: () => floorTool.gizmoMode,
+      setMode: (m) => floorTool.setGizmoMode(m),
+      label: 'Floor',
+      ready: true,
+    };
+  }
+  if (currentTool === 'ref') {
+    return {
+      getMode: () => refTool.gizmoMode,
+      setMode: (m) => refTool.setGizmoMode(m),
+      label: 'Ref image',
+      ready: refTool.hasImage,
+    };
+  }
+  const sub = activeModelSub();
+  if (sub === 'ffd') {
+    return {
+      getMode: () => ffdTool.gizmoMode,
+      setMode: (m) => ffdTool.setGizmoMode(m),
+      label: 'FFD',
+      ready: !!ffdTool.lattice,
+    };
+  }
+  if (sub === 'transform') {
+    return {
+      getMode: () => transformTool.gizmoMode,
+      setMode: (m) => transformTool.setGizmoMode(m),
+      label: 'Model',
+      ready: meshes.length > 0,
+    };
+  }
+  return null; // Select sub-panel: no manipulator active yet
+}
+
+const MODE_LABELS = { translate: 'Move', rotate: 'Rotate', scale: 'Scale' } as const;
+
+/**
+ * Q/W/E/R/Tab act on the CURRENT object's manipulator: the model (Transform
+ * or FFD tool), the floor plane, or the reference image. Q always returns to
+ * the Select tool; Tab cycles the active object's Translate/Rotate/Scale.
+ * Skipped while typing in fields or when a modal is open.
+ */
+function handleManipulatorKey(e: KeyboardEvent): void {
+  const target = e.target as HTMLElement | null;
+  if (target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return;
+  if (document.querySelector('.modal-overlay')) return;
+
+  if (e.key.toLowerCase() === 'q') {
+    setTool('select');
+    toast('Select', 'info');
+    return;
+  }
+
+  const isW = e.key.toLowerCase() === 'w';
+  const isE = e.key.toLowerCase() === 'e';
+  const isR = e.key.toLowerCase() === 'r';
+  const isTab = e.key === 'Tab';
+  if (!isW && !isE && !isR && !isTab) return;
+  e.preventDefault();
+
+  const ctx = manipulatorCtx();
+  if (!ctx) {
+    // Select tool: W/E/R/Tab activate the model manipulator.
+    if (!meshes.length) return;
+    setTool('transform');
+    const mode = isW ? 'translate' : isE ? 'rotate' : isR ? 'scale' : 'translate';
+    transformTool.setGizmoMode(mode);
+    toast(MODE_LABELS[mode], 'info');
+    return;
+  }
+  if (!ctx.ready) {
+    toast(`${ctx.label}: nothing to manipulate yet`, 'info');
+    return;
+  }
+
+  if (isTab) {
+    const modes = ['translate', 'rotate', 'scale'] as const;
+    const next = modes[(modes.indexOf(ctx.getMode()) + 1) % modes.length];
+    ctx.setMode(next);
+    toast(`${ctx.label}: ${MODE_LABELS[next]}`, 'info');
+  } else {
+    const mode = isW ? 'translate' : isE ? 'rotate' : 'scale';
+    ctx.setMode(mode);
+    toast(`${ctx.label}: ${MODE_LABELS[mode]}`, 'info');
+  }
+  buildPanel(); // keep the panel's T/R/S buttons in sync
 }
 
 window.addEventListener('keydown', (e) => {
@@ -271,6 +460,8 @@ window.addEventListener('keydown', (e) => {
   } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
     e.preventDefault();
     doRedo();
+  } else {
+    handleManipulatorKey(e);
   }
 });
 
@@ -283,7 +474,7 @@ let additiveDown = false;
 editor.renderer.domElement.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   if ((editor.gizmo as any).axis) return; // gizmo handles it
-  if (currentTool !== 'ffd' && currentTool !== 'floor') return;
+  if (activeModelSub() !== 'ffd' && currentTool !== 'floor') return;
   pointerTracking = true;
   additiveDown = e.shiftKey;
   pointerDownNdc = editor.ndcFromEvent(e);
@@ -298,7 +489,7 @@ editor.renderer.domElement.addEventListener('pointerup', (e) => {
   if (!pointerTracking) return;
   pointerTracking = false;
   const rect = editor.endRect(e);
-  if (currentTool === 'ffd') handleFFDPointerUp(rect, e);
+  if (activeModelSub() === 'ffd') handleFFDPointerUp(rect, e);
   else if (currentTool === 'floor') handleFloorPointerUp(rect, e);
 });
 
@@ -372,12 +563,17 @@ const panelBody = document.getElementById('panel-body')!;
 function buildPanel(): void {
   unitRefreshers = [];
   panelBody.innerHTML = '';
-  switch (currentTool) {
-    case 'select': buildSelectPanel(); break;
-    case 'transform': buildTransformPanel(); break;
-    case 'ffd': buildFFDPanel(); break;
-    case 'floor': buildFloorPanel(); break;
-    case 'ref': buildRefPanel(); break;
+  if (currentTool === 'model') {
+    const sub = activeModelSub();
+    if (sub === 'select') buildSelectPanel();
+    else if (sub === 'transform') buildTransformPanel();
+    else if (sub === 'ffd') buildFFDPanel();
+  } else if (currentTool === 'floor') {
+    if (floorSub === 'transform') buildNodeTransformPanel('Floor', () => floorTool.gizmoMode, (m) => floorTool.setGizmoMode(m), () => floorTool.hasPendingTransform(), () => floorTool.applyTransform(), () => floorTool.resetTransform());
+    else buildFloorPanel();
+  } else if (currentTool === 'ref') {
+    if (refSub === 'transform') buildNodeTransformPanel('Image', () => refTool.gizmoMode, (m) => refTool.setGizmoMode(m), () => refTool.hasPendingTransform(), () => refTool.applyTransform(), () => refTool.resetTransform());
+    else buildRefPanel();
   }
 }
 
@@ -429,6 +625,7 @@ function switchActiveMesh(i: number): void {
   ffdTool.invalidate(); // rest positions captured for another mesh
   floorTool.areas = [];
   floorTool.clearHitOverlay();
+  floorTool.armAutoFit();
   editor.frameModel();
   buildPanel();
 }
@@ -454,21 +651,23 @@ function buildTransformPanel(): void {
   gm.body.appendChild(hint('Drag the gizmo to preview. Nothing is baked until you press Apply.'));
 
   const gr = group('Rotation (degrees)', panelBody);
-  gr.body.appendChild(numField('X', t.rotX, (v) => { t.rotX = v; transformTool.preview(); refreshAll(); }, { step: 1 }));
-  gr.body.appendChild(numField('Y', t.rotY, (v) => { t.rotY = v; transformTool.preview(); refreshAll(); }, { step: 1 }));
-  gr.body.appendChild(numField('Z', t.rotZ, (v) => { t.rotZ = v; transformTool.preview(); refreshAll(); }, { step: 1 }));
+  for (const ax of ['x', 'y', 'z'] as const) {
+    const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
+    gr.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; transformTool.preview(); refreshAll(); }, { step: 1, axis: ax }));
+  }
 
   const gt = group('Translation', panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
-    const f = unitField(ax.toUpperCase(), t[`t${ax}`], () => units, (v) => { t[`t${ax}`] = v; transformTool.preview(); refreshAll(); });
+    const f = unitField(ax.toUpperCase(), t[`t${ax}`], () => units, (v) => { t[`t${ax}`] = v; transformTool.preview(); refreshAll(); }, { axis: ax });
     unitRefreshers.push(f.refresh);
     gt.body.appendChild(f.root);
   }
 
   const gs = group('Scale', panelBody);
-  gs.body.appendChild(numField('X', t.sx, (v) => { t.sx = v; transformTool.preview(); refreshAll(); }, { step: 0.05 }));
-  gs.body.appendChild(numField('Y', t.sy, (v) => { t.sy = v; transformTool.preview(); refreshAll(); }, { step: 0.05 }));
-  gs.body.appendChild(numField('Z', t.sz, (v) => { t.sz = v; transformTool.preview(); refreshAll(); }, { step: 0.05 }));
+  for (const ax of ['x', 'y', 'z'] as const) {
+    const k = `s${ax}` as 'sx' | 'sy' | 'sz';
+    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+  }
 
   const ga = group('Apply', panelBody);
   const applyBtn = button('Apply transform (bake into mesh)', () => {
@@ -483,6 +682,62 @@ function buildTransformPanel(): void {
   resetBtn.style.width = '100%';
   ga.body.appendChild(resetBtn);
   ga.body.appendChild(hint('Rotation/scale pivot = mesh bounding-box center. Translation is in world axes.'));
+}
+
+/**
+ * Transform sub-panel for tool objects (floor plane, ref image) — the same
+ * group layout as the model's Transform panel: Gizmo / Rotation / Translation
+ * / Scale / Apply. Values live-read the object's pending transform.
+ */
+function buildNodeTransformPanel(
+  label: string,
+  getMode: () => 'translate' | 'rotate' | 'scale',
+  setMode: (m: 'translate' | 'rotate' | 'scale') => void,
+  hasPending: () => boolean,
+  applyFn: () => boolean,
+  resetFn: () => void,
+): void {
+  const nt = currentTool === 'floor' ? floorTool.nodeTransform : refTool.nodeTransform;
+  const t = nt.pending;
+
+  const gm = group('Gizmo', panelBody);
+  gm.body.appendChild(gizmoModeButtons(setMode, getMode()));
+  gm.body.appendChild(hint('Drag the gizmo to preview. Nothing is baked until you press Apply.'));
+
+  const gr = group('Rotation (degrees)', panelBody);
+  for (const ax of ['x', 'y', 'z'] as const) {
+    const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
+    gr.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; nt.preview(); refreshAll(); }, { step: 1, axis: ax }));
+  }
+
+  const gt = group('Translation', panelBody);
+  for (const ax of ['x', 'y', 'z'] as const) {
+    const f = unitField(ax.toUpperCase(), t[`t${ax}`], () => units, (v) => { t[`t${ax}`] = v; nt.preview(); refreshAll(); }, { axis: ax });
+    unitRefreshers.push(f.refresh);
+    gt.body.appendChild(f.root);
+  }
+
+  const gs = group('Scale', panelBody);
+  for (const ax of ['x', 'y', 'z'] as const) {
+    const k = `s${ax}` as 'sx' | 'sy' | 'sz';
+    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; nt.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+  }
+
+  const ga = group('Apply', panelBody);
+  const applyBtn = button(`Apply transform (bake into ${label.toLowerCase()})`, () => {
+    if (applyFn()) {
+      toast(`${label} transform baked.`, 'ok');
+      buildPanel();
+      refreshAll();
+    } else toast('No pending transform.');
+  }, 'btn primary');
+  applyBtn.style.width = '100%';
+  const resetBtn = button('Reset pending', () => { resetFn(); buildPanel(); });
+  resetBtn.style.width = '100%';
+  ga.body.append(applyBtn, resetBtn);
+  ga.body.appendChild(hint(hasPending()
+    ? '⚠ Pending transform (previewed, not baked). Apply or Reset.'
+    : 'Rotation/scale pivot = the object origin. Translation is in world axes.'));
 }
 
 function gizmoModeButtons(setMode: (m: 'translate' | 'rotate' | 'scale') => void, active: string): HTMLDivElement {
@@ -566,27 +821,39 @@ function refreshFFDInfo(): void {
 }
 
 function buildFloorPanel(): void {
-  panelTitle.textContent = 'Floor leveling';
+  panelTitle.textContent = 'Floor';
   if (!meshes.length) {
     panelBody.appendChild(hint('Import a model first.'));
     return;
   }
   const s = floorTool.settings;
 
+  // NOTE: transform gizmo/apply/reset lives in the Transform SUB-TAB
+  // (buildNodeTransformPanel) — same layout as the model's Transform panel.
+  if (floorTool.hasPendingTransform()) {
+    panelBody.appendChild(hint('⚠ Pending floor transform (previewed). Use the Transform sub-tab to Apply or Reset.'));
+  }
   const gp = group('Floor plane', panelBody);
-  gp.body.appendChild(gizmoModeButtons((m) => floorTool.setGizmoMode(m), floorTool.gizmoMode));
 
-  // Fields re-read floorTool.settings on refresh so gizmo drags live-update them.
-  const fx = unitField('Width X', s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); floorTool.updatePlane(); });
-  const fz = unitField('Depth Z', s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); floorTool.updatePlane(); });
-  const fy = unitField('Height Y', s.y, () => units, (v) => { s.y = v; floorTool.updatePlane(); });
-  const fcx = unitField('Center X', s.cx, () => units, (v) => { s.cx = v; floorTool.updatePlane(); });
-  const fcz = unitField('Center Z', s.cz, () => units, (v) => { s.cz = v; floorTool.updatePlane(); });
-  const rot = numField('Spin / tilt (deg)', floorTool.rotationDeg.y, (v) => floorTool.setRotationDeg(undefined, v, undefined), { step: 1 });
+  // All fields go through the SAME pending transform as the Transform
+  // sub-panel: they read the PREVIEWED state and write via setWorld* —
+  // preview on type, Apply bakes, Reset discards. One implementation for
+  // model / floor / ref image.
+  const nt = floorTool.nodeTransform;
+  const previewed = () => nt.previewedTRS();
+  const fx = unitField('Width X', s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); });
+  const fz = unitField('Depth Z', s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); });
+  const fy = unitField('Height Y', s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); });
+  const fcx = unitField('Center X', s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); });
+  const fcz = unitField('Center Z', s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); });
+  const rot = numField('Spin / tilt (deg)', floorTool.rotationDeg.y, (v) => nt.setWorldRotationDeg({ y: v }), { step: 1 });
   const sync = () => {
-    fx.set(s.sizeX); fz.set(s.sizeZ); fy.set(s.y); fcx.set(s.cx); fcz.set(s.cz);
-    (rot.querySelector('input') as HTMLInputElement).value = String(Math.round(floorTool.rotationDeg.y));
+    const trs = previewed();
+    fx.set(trs.scale.x); fz.set(trs.scale.z); fy.set(trs.pos.y); fcx.set(trs.pos.x); fcz.set(trs.pos.z);
+    const rotInput = rot.querySelector('input');
+    if (rotInput) rotInput.value = String(Math.round(THREE.MathUtils.radToDeg(trs.rotDeg.y)));
   };
+  floorTransformSyncers.length = 0;
   floorTransformSyncers.push(sync);
   unitRefreshers.push(fx.refresh, fz.refresh, fy.refresh, fcx.refresh, fcz.refresh);
   gp.body.append(fx.root, fz.root, fy.root, fcx.root, fcz.root, rot);
@@ -597,12 +864,12 @@ function buildFloorPanel(): void {
     const m = meshes[activeMeshIndex];
     m.geometry.computeBoundingBox();
     s.y = m.geometry.boundingBox!.min.y;
-    floorTool.updatePlane();
+    floorTool.updatePlane(true);
     buildPanel();
   });
   rowFit.append(fitBtn, bottomBtn);
   gp.body.appendChild(rowFit);
-  gp.body.appendChild(hint('Drag the gizmo in the viewport to move / rotate / scale the plane (T/R/S above switch the mode).'));
+
 
   const gscan = group('Intersections', panelBody);
   const scanBtn = button('Scan intersections', () => {
@@ -627,6 +894,13 @@ function buildFloorPanel(): void {
     'Drop = rigid translate of the whole selection until its lowest point touches the plane. ' +
     'Flatten = vertices below the plane are pulled onto it. Both blend smoothly at the region border.',
   ));
+}
+
+let floorFieldAppliers: (() => void)[] = [];
+
+/** Re-read pending→settings into the floor panel fields (after gizmo drag). */
+function refreshFloorTransformFields(): void {
+  for (const fn of floorFieldAppliers) fn();
 }
 
 function refreshFloorAreas(): void {
@@ -682,8 +956,11 @@ function buildRefPanel(): void {
   }
 
   if (refTool.hasImage) {
+    // NOTE: transform gizmo/apply/reset lives in the Transform SUB-TAB.
+    if (refTool.hasPendingTransform()) {
+      panelBody.appendChild(hint('⚠ Pending image transform (previewed). Use the Transform sub-tab to Apply or Reset.'));
+    }
     const go = group('Placement', panelBody);
-    go.body.appendChild(gizmoModeButtons((m) => refTool.setGizmoMode(m), refTool.gizmoMode));
     const ori = selectField('Orientation', [
       { value: 'horizontal', label: 'Horizontal (floor)' },
       { value: 'vertical', label: 'Vertical (wall)' },
@@ -708,6 +985,7 @@ function setStatus(text: string): void {
 }
 
 function refreshAll(): void {
+  syncTopbarChecks();
   (document.getElementById('btn-undo') as HTMLButtonElement).disabled = !history.canUndo;
   (document.getElementById('btn-redo') as HTMLButtonElement).disabled = !history.canRedo;
   const parts: string[] = [];
