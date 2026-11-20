@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
 import type { MeshData, PendingTransform } from './types';
-import { geometryCenter } from './transform';
+import { DEFAULT_TRANSFORM, geometryCenter } from './transform';
 import type { History } from './history';
 
 /**
@@ -43,11 +43,12 @@ export class TransformTool {
   }
 
   setActive(v: boolean): void {
+    const was = this.active;
     this.active = v;
     if (v) {
       this.attachGizmo(this.gizmoMode);
       this.preview();
-    } else {
+    } else if (was) {
       this.editor.detachGizmo();
       this.clearPreview();
     }
@@ -65,10 +66,33 @@ export class TransformTool {
     const mesh = this.getMesh();
     if (!mesh) return;
     const c = geometryCenter(mesh);
-    this.proxy.position.copy(c);
-    this.proxy.quaternion.identity();
+    const t = this.pending;
+    // Pivot = the PREVIEWED bbox center (baked center + pending translation).
+    this.proxy.position.set(c.x + t.tx, c.y + t.ty, c.z + t.tz);
+    // TransformControls scale mode is local-space; orienting the proxy to the
+    // pending rotation makes its axes match the axes S actually scales.
+    this.proxy.quaternion.copy(this.pendingQuaternion());
     this.proxy.scale.set(1, 1, 1);
     this.editor.attachGizmo(this.proxy, mode, 'world');
+  }
+
+  private pendingQuaternion(): THREE.Quaternion {
+    const t = this.pending;
+    const e = new THREE.Euler(
+      THREE.MathUtils.degToRad(t.rotX),
+      THREE.MathUtils.degToRad(t.rotY),
+      THREE.MathUtils.degToRad(t.rotZ),
+      'XYZ',
+    );
+    return new THREE.Quaternion().setFromEuler(e);
+  }
+
+  /** Re-seat the proxy on the previewed pivot/orientation while idle. */
+  private syncGizmoIfIdle(): void {
+    if (!this.active) return;
+    if (this.editor.gizmoDraggingNow) return;
+    if (this.editor.gizmo.object !== this.proxy) return;
+    this.attachGizmo(this.gizmoMode);
   }
 
   // ---------- pending <-> node matrix ----------
@@ -100,6 +124,7 @@ export class TransformTool {
     mesh.object.matrixAutoUpdate = false;
     mesh.object.matrix.copy(this.matrixFromPending());
     mesh.object.matrixWorldNeedsUpdate = true;
+    this.syncGizmoIfIdle();
   }
 
   clearPreview(): void {
@@ -155,9 +180,14 @@ export class TransformTool {
       this.pending.ty = ds.pending.ty + (this.proxy.position.y - ds.p.y);
       this.pending.tz = ds.pending.tz + (this.proxy.position.z - ds.p.z);
     } else {
-      this.pending.sx = ds.pending.sx * this.proxy.scale.x;
-      this.pending.sy = ds.pending.sy * this.proxy.scale.y;
-      this.pending.sz = ds.pending.sz * this.proxy.scale.z;
+      // Ratio, not absolute proxy scale: TransformControls starts every drag
+      // from object.scale = _scaleStart * dragFactor.
+      const rx = ds.s.x !== 0 ? this.proxy.scale.x / ds.s.x : 1;
+      const ry = ds.s.y !== 0 ? this.proxy.scale.y / ds.s.y : 1;
+      const rz = ds.s.z !== 0 ? this.proxy.scale.z / ds.s.z : 1;
+      this.pending.sx = ds.pending.sx * rx;
+      this.pending.sy = ds.pending.sy * ry;
+      this.pending.sz = ds.pending.sz * rz;
     }
     this.preview();
     this.onChanged();
@@ -208,7 +238,8 @@ export class TransformTool {
         if (nor) nor.needsUpdate = true;
         mesh.geometry.computeBoundingBox();
         mesh.geometry.computeBoundingSphere();
-        this.pending = { ...pendingBefore };
+        // Keep the SAME pending object identity: panels capture it.
+        Object.assign(this.pending, pendingBefore);
         this.preview();
       },
       redo: () => {
@@ -218,19 +249,21 @@ export class TransformTool {
         if (nor) nor.needsUpdate = true;
         mesh.geometry.computeBoundingBox();
         mesh.geometry.computeBoundingSphere();
-        this.pending = { rotX: 0, rotY: 0, rotZ: 0, tx: 0, ty: 0, tz: 0, sx: 1, sy: 1, sz: 1 };
+        Object.assign(this.pending, DEFAULT_TRANSFORM);
         this.clearPreview();
+        this.syncGizmoIfIdle();
       },
     });
 
-    this.pending = { rotX: 0, rotY: 0, rotZ: 0, tx: 0, ty: 0, tz: 0, sx: 1, sy: 1, sz: 1 };
+    Object.assign(this.pending, DEFAULT_TRANSFORM);
     this.clearPreview();
+    this.syncGizmoIfIdle();
     this.onChanged();
     return true;
   }
 
   resetPending(): void {
-    this.pending = { rotX: 0, rotY: 0, rotZ: 0, tx: 0, ty: 0, tz: 0, sx: 1, sy: 1, sz: 1 };
+    Object.assign(this.pending, DEFAULT_TRANSFORM);
     this.preview();
     this.onChanged();
   }

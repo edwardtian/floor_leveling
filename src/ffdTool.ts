@@ -481,6 +481,7 @@ export class FFDTool {
   // ---------- tool lifecycle ----------
 
   setActive(v: boolean): void {
+    const was = this.active;
     this.active = v;
     if (v) {
       // Another tool may have edited vertices since the last FFD evaluation
@@ -495,7 +496,7 @@ export class FFDTool {
         this.paintSelection();
         this.attachSelectionGizmo();
       }
-    } else {
+    } else if (was) {
       this.editor.detachGizmo();
       this.disposeVisuals();
     }

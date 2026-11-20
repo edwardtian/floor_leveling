@@ -130,22 +130,38 @@ export interface NormalizationResult {
 }
 
 /**
- * R7 normalization preview: uniform scale so max dimension == 1 m,
- * center XZ, feet (bbox min Y) at y = 0.
+ * R7 normalization: uniform scale so the box's max dimension == 1 m,
+ * center XZ, feet (bbox min Y) at y = 0. One box for the WHOLE scene — never
+ * per mesh, or a multi-mesh assembly collapses onto the origin.
  */
-export function computeNormalization(mesh: MeshData): NormalizationResult {
-  mesh.geometry.computeBoundingBox();
-  const size = mesh.geometry.boundingBox!.getSize(new THREE.Vector3());
+export function computeNormalizationForBox(box: THREE.Box3): NormalizationResult {
+  if (box.isEmpty()) {
+    return { scale: 1, offset: new THREE.Vector3(), heightMeters: 0 };
+  }
+  const size = box.getSize(new THREE.Vector3());
   const maxDim = Math.max(size.x, size.y, size.z);
   const scale = maxDim > 1e-9 ? 1 / maxDim : 1;
-  const center = mesh.geometry.boundingBox!.getCenter(new THREE.Vector3());
-  const offset = new THREE.Vector3(-center.x, -mesh.geometry.boundingBox!.min.y, -center.z);
+  const center = box.getCenter(new THREE.Vector3());
+  const offset = new THREE.Vector3(-center.x, -box.min.y, -center.z);
   return { scale, offset, heightMeters: size.y * scale };
 }
 
-export function normalizationSummary(mesh: MeshData, units: MeasurementUnits): string {
-  const r = computeNormalization(mesh);
+/** Single-mesh convenience wrapper. */
+export function computeNormalization(mesh: MeshData): NormalizationResult {
+  mesh.geometry.computeBoundingBox();
+  return computeNormalizationForBox(mesh.geometry.boundingBox!);
+}
+
+export function normalizationSummaryForBox(box: THREE.Box3, units: MeasurementUnits): string {
+  const r = computeNormalizationForBox(box);
   const u = METER_TO_UNIT[units];
   const f = (x: number) => (x * u).toFixed(2);
-  return `scale ×${r.scale.toFixed(4)}, then translate (${f(r.offset.x)}, ${f(r.offset.y)}, ${f(r.offset.z)}) ${units}`;
+  // The export matrix is S·T (translate first, then scale), so describe that
+  // order with the pre-scale offset.
+  return `translate (${f(r.offset.x)}, ${f(r.offset.y)}, ${f(r.offset.z)}) ${units}, then scale ×${r.scale.toFixed(4)}`;
+}
+
+export function normalizationSummary(mesh: MeshData, units: MeasurementUnits): string {
+  mesh.geometry.computeBoundingBox();
+  return normalizationSummaryForBox(mesh.geometry.boundingBox!, units);
 }

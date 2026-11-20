@@ -28,6 +28,9 @@ export class PendingNodeTransform {
     p: THREE.Vector3;
     pending: TransformValues;
   } | null = null;
+  /** Mode the proxy is currently attached with (for re-seating). */
+  private gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
+  private changeListeners: (() => void)[] = [];
 
   constructor(editor: Editor, history: History | null, onChanged: () => void, proxyName: string) {
     this.editor = editor;
@@ -37,12 +40,21 @@ export class PendingNodeTransform {
     editor.scene.add(this.proxy);
   }
 
+  /** Subscribe to preview/apply/reset (used to mirror the pending state). */
+  addChangeListener(fn: () => void): void {
+    this.changeListeners.push(fn);
+  }
+
+  private notifyChanged(): void {
+    for (const fn of this.changeListeners) fn();
+  }
+
   /** Snapshot the node's current TRS as the baked base (clears pending). */
   captureBase(): void {
     this.base.pos.copy(this.node.position);
     this.base.quat.copy(this.node.quaternion);
     this.base.scale.copy(this.node.scale);
-    this.pending = { ...DEFAULT_TRANSFORM };
+    Object.assign(this.pending, DEFAULT_TRANSFORM);
   }
 
   /**
@@ -97,6 +109,8 @@ export class PendingNodeTransform {
     n.matrixAutoUpdate = false;
     n.matrix.copy(this.matrixFromPending());
     n.matrixWorldNeedsUpdate = true;
+    this.syncGizmoIfIdle();
+    this.notifyChanged();
   }
 
   /** Restore direct TRS control (used by reset). */
@@ -110,12 +124,25 @@ export class PendingNodeTransform {
     n.updateMatrix();
   }
 
-  /** Gizmo attach at the node's origin (pivot). */
+  /**
+   * Re-seat the proxy on the PREVIEWED pivot/orientation while no drag is in
+   * flight. Scale mode in TransformControls is local-space, so a world-aligned
+   * proxy would scale along the wrong axes once the object is rotated.
+   */
+  private syncGizmoIfIdle(): void {
+    if (this.editor.gizmoDraggingNow) return;
+    if (this.editor.gizmo.object !== this.proxy) return;
+    this.attachGizmo(this.gizmoMode);
+  }
+
+  /** Gizmo attach at the previewed pivot, oriented to the previewed rotation. */
   attachGizmo(mode: 'translate' | 'rotate' | 'scale'): void {
     const n = this.node;
     if (!n) return;
-    this.proxy.position.copy(n.position);
-    this.proxy.quaternion.identity();
+    this.gizmoMode = mode;
+    const trs = this.previewedTRS();
+    this.proxy.position.copy(trs.pos);
+    this.proxy.quaternion.copy(this.previewedQuaternion());
     this.proxy.scale.set(1, 1, 1);
     this.editor.attachGizmo(this.proxy, mode, 'world');
   }
@@ -157,9 +184,16 @@ export class PendingNodeTransform {
       this.pending.ty = start.pending.ty + (this.proxy.position.y - start.p.y);
       this.pending.tz = start.pending.tz + (this.proxy.position.z - start.p.z);
     } else {
-      this.pending.sx = start.pending.sx * this.proxy.scale.x;
-      this.pending.sy = start.pending.sy * this.proxy.scale.y;
-      this.pending.sz = start.pending.sz * this.proxy.scale.z;
+      // TransformControls starts each drag from the proxy's CURRENT scale
+      // (object.scale = _scaleStart * dragFactor). pending must therefore
+      // multiply by the drag RATIO, not by the absolute proxy scale —
+      // otherwise consecutive drags compound (2× then 1.5× became 6×).
+      const rx = start.s.x !== 0 ? this.proxy.scale.x / start.s.x : 1;
+      const ry = start.s.y !== 0 ? this.proxy.scale.y / start.s.y : 1;
+      const rz = start.s.z !== 0 ? this.proxy.scale.z / start.s.z : 1;
+      this.pending.sx = start.pending.sx * rx;
+      this.pending.sy = start.pending.sy * ry;
+      this.pending.sz = start.pending.sz * rz;
     }
     this.preview();
     this.onChanged();
@@ -192,6 +226,7 @@ export class PendingNodeTransform {
         n.scale.copy(trs.scale);
         n.updateMatrix();
         this.captureBase();
+        this.syncGizmoIfIdle();
       };
       this.history.push({
         name: 'Apply transform',
@@ -199,6 +234,7 @@ export class PendingNodeTransform {
         redo: () => applyTRS(after),
       });
     }
+    this.syncGizmoIfIdle();
     this.onChanged();
     return true;
   }
@@ -206,8 +242,9 @@ export class PendingNodeTransform {
   /** Discard pending (node returns to its baked base). */
   reset(): void {
     if (!this.hasPending) return;
-    this.pending = { ...DEFAULT_TRANSFORM };
+    Object.assign(this.pending, DEFAULT_TRANSFORM);
     this.clearPreview();
+    this.syncGizmoIfIdle();
     this.onChanged();
   }
 
@@ -215,7 +252,7 @@ export class PendingNodeTransform {
    * Force pending to the given values (numeric entry) and preview.
    */
   setPending(t: TransformValues): void {
-    this.pending = { ...t };
+    Object.assign(this.pending, t);
     this.preview();
     this.onChanged();
   }
@@ -224,7 +261,19 @@ export class PendingNodeTransform {
 
   /** The node's local matrix including pending (base ∘ pending). */
   previewedMatrix(): THREE.Matrix4 {
-    return this.hasPending ? this.matrixFromPending() : this.node.matrix;
+    if (this.hasPending) return this.matrixFromPending();
+    const n = this.node;
+    // TRS is authoritative when no preview is armed; make sure the local
+    // matrix reflects direct TRS writes (loadImage, updatePlane, tests).
+    if (n && n.matrixAutoUpdate) n.updateMatrix();
+    return n ? n.matrix : new THREE.Matrix4();
+  }
+
+  /** Previewed world orientation (base ∘ pending). */
+  previewedQuaternion(): THREE.Quaternion {
+    const q = new THREE.Quaternion();
+    this.previewedMatrix().decompose(new THREE.Vector3(), q, new THREE.Vector3());
+    return q;
   }
 
   /** Previewed TRS: position, rotation (deg, XYZ Euler), scale. */

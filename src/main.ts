@@ -15,7 +15,7 @@ import {
 } from './ui';
 import { fmtLen, fmtBytes } from './units';
 import { formatBox, sceneBox, totalTriangles, totalVertices, downloadBlob, baseName } from './modelUtils';
-import { normalizationSummary } from './transform';
+import { computeNormalizationForBox, normalizationSummaryForBox } from './transform';
 
 // ---------- core state ----------
 
@@ -43,12 +43,20 @@ editor.addGizmoDragStartListener(() => {
 });
 editor.addGizmoDragEndListener(() => {
   if (activeModelSub() === 'ffd') ffdTool.endGizmoDrag();
+  if (activeModelSub() === 'transform') buildPanel(); // pending values changed
   if (currentTool === 'floor') {
+    // Reset the proxy (its scale/rotation is folded into pending) and re-seat
+    // it on the previewed pivot before mirroring the fields.
+    floorTool.normalizeScale();
+    floorTool.nodeTransform.attachGizmo(floorTool.gizmoMode);
     floorTool.syncFromGizmo(); // clamp scale, mirror settings
     refreshFloorTransformFields();
     buildPanel(); // refresh pending hint / Apply state
   }
-  if (currentTool === 'ref') buildPanel(); // re-seat fields + pending hint
+  if (currentTool === 'ref') {
+    refTool.nodeTransform.attachGizmo(refTool.gizmoMode);
+    buildPanel(); // re-seat fields + pending hint
+  }
 });
 editor.gizmo.addEventListener('objectChange', () => {
   const gizmoObj = editor.gizmo.object as THREE.Object3D;
@@ -103,6 +111,11 @@ async function importFromFile(file: File): Promise<void> {
     setStatus(`Importing ${file.name}…`);
     setTool('select');
     ffdTool.invalidate(); // new model → old lattice is meaningless
+    // Discard pending object edits from the previous model; otherwise they
+    // re-preview on the new mesh (and block the floor auto-fit).
+    transformTool.resetPending();
+    transformTool.clearPreview();
+    floorTool.resetTransform();
     floorTool.clearHitOverlay();
     floorTool.areas = [];
     floorTool.selectedIds.clear();
@@ -133,6 +146,12 @@ function fmtNumber(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
 }
 
+/** Keep a scale component non-zero (0 collapses the mesh and zeroes normals). */
+function nonZeroScale(v: number): number {
+  if (Math.abs(v) >= 1e-4) return v;
+  return v < 0 ? -1e-4 : 1e-4;
+}
+
 async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
   if (meshes.length === 0) return;
 
@@ -153,16 +172,15 @@ async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
   }
 
   // 2) Normalization reminder (Q6).
-  const active = meshes[activeMeshIndex];
   const box = sceneBox(meshes);
-  const size = box.getSize(new THREE.Vector3());
+  const norm = computeNormalizationForBox(box);
   const choice = await modal(
     'Export options',
     `<div class="kv"><span>Model size</span><b>${formatBox(box, units)}</b></div>
      <div class="kv"><span>Triangles</span><b>${fmtNumber(totalTriangles(meshes))}</b></div>
      <div style="margin:8px 0 4px;">Before export you may <b>normalize</b> the model
      (uniform scale to 1 m max dimension, centered in XZ, feet at y&nbsp;=&nbsp;0):</div>
-     <div class="hint">${normalizationSummary(active, units)} → height ${fmtLen(size.y, units)} → normalized.</div>
+     <div class="hint">${normalizationSummaryForBox(box, units)} → height ${fmtLen(norm.heightMeters, units)} (normalized).</div>
      <div class="hint" style="margin-top:6px;">Floor plane, reference image and helpers are never exported.</div>`,
     [
       { label: 'Normalize & export', value: 'normalize', primary: true },
@@ -224,10 +242,18 @@ function setTool(id: ToolId): void {
 function applyToolState(): void {
   const sub = activeModelSub();
 
-  transformTool.setActive(!!sub && sub === 'transform');
-  ffdTool.setActive(!!sub && sub === 'ffd');
-  floorTool.setActive(currentTool === 'floor');
-  refTool.setActive(currentTool === 'ref');
+  // Deactivate every tool FIRST, then activate the one that owns the gizmo.
+  // Previously the new tool attached its proxy and a later setActive(false)
+  // unconditionally detached it, leaving Transform/FFD without a gizmo.
+  transformTool.setActive(false);
+  ffdTool.setActive(false);
+  floorTool.setActive(false);
+  refTool.setActive(false);
+
+  if (sub === 'transform') transformTool.setActive(true);
+  else if (sub === 'ffd') ffdTool.setActive(true);
+  else if (currentTool === 'floor') floorTool.setActive(true);
+  else if (currentTool === 'ref') refTool.setActive(true);
 
   // Left-drag meaning: rect-select/FFD picking need it; orbit for the rest.
   editor.setLeftButtonOrbit(!sub || sub === 'select' || currentTool === 'ref');
@@ -345,7 +371,11 @@ function afterHistoryJump(label: string): void {
   ffdTool.repaint();
   if (floorTool.active && floorTool.areas.length) floorTool.scan();
   transformTool.preview();
+  // The floor's settings mirror its node TRS; a history jump can change that
+  // TRS (Apply transform undo/redo), so re-sync it before rebuilding fields.
+  floorTool.syncFromGizmo();
   refreshAll();
+  buildPanel();
   toast(label);
 }
 
@@ -666,19 +696,20 @@ function buildTransformPanel(): void {
   const gs = group('Scale', panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
     const k = `s${ax}` as 'sx' | 'sy' | 'sz';
-    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = nonZeroScale(v); transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
   }
 
   const ga = group('Apply', panelBody);
   const applyBtn = button('Apply transform (bake into mesh)', () => {
     if (transformTool.apply()) {
       toast('Transform baked into geometry.', 'ok');
+      buildPanel(); // re-bind the fields to the reset pending object
       refreshAll();
     } else toast('No pending transform.');
   }, 'btn primary');
   applyBtn.style.width = '100%';
   ga.body.appendChild(applyBtn);
-  const resetBtn = button('Reset pending', () => { transformTool.resetPending(); refreshAll(); });
+  const resetBtn = button('Reset pending', () => { transformTool.resetPending(); buildPanel(); refreshAll(); });
   resetBtn.style.width = '100%';
   ga.body.appendChild(resetBtn);
   ga.body.appendChild(hint('Rotation/scale pivot = mesh bounding-box center. Translation is in world axes.'));
@@ -720,7 +751,7 @@ function buildNodeTransformPanel(
   const gs = group('Scale', panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
     const k = `s${ax}` as 'sx' | 'sy' | 'sz';
-    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; nt.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = nonZeroScale(v); nt.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
   }
 
   const ga = group('Apply', panelBody);
@@ -855,11 +886,12 @@ function buildFloorPanel(): void {
   };
   floorTransformSyncers.length = 0;
   floorTransformSyncers.push(sync);
+  sync(); // show the PREVIEWED values, not a stale settings mirror
   unitRefreshers.push(fx.refresh, fz.refresh, fy.refresh, fcx.refresh, fcz.refresh);
   gp.body.append(fx.root, fz.root, fy.root, fcx.root, fcz.root, rot);
 
   const rowFit = el('div', 'row');
-  const fitBtn = button('Fit to model', () => { floorTool.fitToModel(); buildPanel(); });
+  const fitBtn = button('Fit to model', () => { floorTool.fitToModel(true); buildPanel(); });
   const bottomBtn = button('Floor @ bottom', () => {
     const m = meshes[activeMeshIndex];
     m.geometry.computeBoundingBox();
@@ -968,8 +1000,8 @@ function buildRefPanel(): void {
     go.body.appendChild(ori.root);
     const st = refTool.state;
     const fy = unitField('Height Y', st.y, () => units, (v) => refTool.setY(v));
-    const fw = unitField('Width', st.w, () => units, (v) => refTool.setSize(v, st.h));
-    const fh = unitField('Height', st.h, () => units, (v) => refTool.setSize(st.w, v));
+    const fw = unitField('Width', st.w, () => units, (v) => refTool.setWidth(v));
+    const fh = unitField('Height', st.h, () => units, (v) => refTool.setHeight(v));
     const fa = numField('Spin (deg)', st.angleDeg, (v) => refTool.setAngleDeg(v), { step: 1 });
     unitRefreshers.push(fy.refresh, fw.refresh, fh.refresh);
     go.body.append(fy.root, fw.root, fh.root, fa);

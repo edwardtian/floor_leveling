@@ -1204,6 +1204,201 @@ ok('hotkeys ignored while typing in fields', fieldPress === 'no-field' || fieldP
 await page.keyboard.press('KeyQ');
 await page.waitForTimeout(200);
 
+// ---- scaling regressions: one axis / two axes / whole object
+await page.click('#tool-floor');
+await page.waitForTimeout(300);
+
+const floorScaleRegression = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const ed = window.__FL__.editor;
+  const nt = f.nodeTransform;
+  const root = f.planeVisuals.plane.parent;
+  const THREE = window.__FL__.THREE;
+  f.resetTransform();
+  nt.attachGizmo('scale');
+  root.rotation.set(0, 0, 0);
+  f.updatePlane();
+  const base = root.scale.x;
+  const drag = (s) => {
+    ed.gizmoDragging = true;
+    nt.onGizmoStart();
+    nt.proxy.scale.set(s, 1, s);
+    nt.onGizmoChange('scale');
+    ed.gizmoDragging = false;
+    nt.attachGizmo('scale'); // what main.ts does on drag end
+  };
+  drag(2);
+  drag(1.5);
+  root.updateMatrixWorld(true);
+  const p = new THREE.Vector3(), q = new THREE.Quaternion(), sc = new THREE.Vector3();
+  root.matrixWorld.decompose(p, q, sc);
+  return { base, pending: nt.pending.sx, preview: sc.x };
+});
+ok('floor repeated two-axis scale does not compound',
+  Math.abs(floorScaleRegression.pending - 3) < 1e-6 &&
+  Math.abs(floorScaleRegression.preview - floorScaleRegression.base * 3) < 1e-3,
+  JSON.stringify(floorScaleRegression));
+
+const floorUniformHandle = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  f.setGizmoMode('scale');
+  const g = window.__FL__.editor.gizmo._gizmo;
+  g.updateMatrixWorld(true);
+  const h = g.gizmo.scale.children.find((c) => c.name === 'XYZ');
+  return { visible: !!h && h.visible, showY: window.__FL__.editor.gizmo.showY };
+});
+ok('floor scale mode keeps the uniform XYZ handle',
+  floorUniformHandle.visible && floorUniformHandle.showY, JSON.stringify(floorUniformHandle));
+
+const scalePendingFit = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const nt = f.nodeTransform;
+  f.resetTransform();
+  nt.attachGizmo('scale');
+  f.planeVisuals.plane.parent.rotation.set(0, 0, 0);
+  f.updatePlane();
+  nt.pending.sx = 2;
+  nt.preview();
+  const fitOk = f.fitToModel(true);
+  return {
+    fitOk,
+    pending: f.hasPendingTransform(),
+    settingsX: f.settings.sizeX,
+    baseX: f.planeVisuals.plane.parent.scale.x,
+  };
+});
+ok('floor Fit with pending bakes then fits',
+  scalePendingFit.fitOk && !scalePendingFit.pending && Math.abs(scalePendingFit.baseX - scalePendingFit.settingsX) < 1e-6,
+  JSON.stringify(scalePendingFit));
+
+const floorBottom = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const nt = f.nodeTransform;
+  const root = f.planeVisuals.plane.parent;
+  f.resetTransform();
+  nt.attachGizmo('scale');
+  root.rotation.set(0, 0, 0);
+  f.updatePlane();
+  const baseX = root.scale.x;
+  nt.pending.sx = 2;
+  nt.preview();
+  const m = window.__FL__.meshes[0];
+  m.geometry.computeBoundingBox();
+  f.settings.y = m.geometry.boundingBox.min.y;
+  f.updatePlane(true);
+  return { baseX, finalX: root.scale.x, pending: f.hasPendingTransform() };
+});
+ok('floor @ bottom keeps a pending scale',
+  !floorBottom.pending && Math.abs(floorBottom.finalX - floorBottom.baseX * 2) < 1e-3,
+  JSON.stringify(floorBottom));
+
+// Gizmo ownership: leaving the floor must not leave the next tool gizmo-less.
+await page.evaluate(() => {
+  window.__FL__.setTool('floor');
+  window.__FL__.floorTool.setGizmoMode('scale');
+  window.__FL__.setTool('transform');
+});
+await page.waitForTimeout(200);
+const gizmoOwnership = await page.evaluate(() => ({
+  obj: window.__FL__.editor.gizmo.object?.name ?? null,
+  visible: window.__FL__.editor.gizmoHelper.visible,
+}));
+ok('switching floor→Transform keeps the Transform gizmo',
+  gizmoOwnership.obj === 'TransformGizmoProxy' && gizmoOwnership.visible, JSON.stringify(gizmoOwnership));
+
+// Model Transform panel must stay bound after Apply (pending object identity).
+const modelApplyRebind = await page.evaluate(() => {
+  const tt = window.__FL__.transformTool;
+  tt.resetPending();
+  const scaleInput = () => [...document.querySelectorAll('#panel-body .group')]
+    .find((g) => g.querySelector('.gtitle')?.textContent === 'Scale')
+    ?.querySelectorAll('input')[0];
+  const set = (input, v) => {
+    if (!input) return false;
+    input.value = String(v);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  };
+  if (!set(scaleInput(), 2)) return { error: 'no scale field' };
+  const applyBtn = [...document.querySelectorAll('#panel-body button')]
+    .find((b) => b.textContent.startsWith('Apply transform'));
+  applyBtn.click();
+  if (!set(scaleInput(), 3)) return { error: 'no scale field after apply' };
+  return { pending: tt.pending.sx, hasPending: tt.hasPending };
+});
+ok('Transform panel stays bound after Apply',
+  Math.abs(modelApplyRebind.pending - 3) < 1e-6, JSON.stringify(modelApplyRebind));
+
+// Reference image: aspect, world-space size, orientation round-trip and
+// independent Width/Height edits.
+const refSize = await page.evaluate(async () => {
+  const { refTool: r, THREE } = window.__FL__;
+  const c = document.createElement('canvas');
+  c.width = 400; c.height = 200;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, 400, 200);
+  const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
+  await r.loadImage(new File([blob], 'wide.png', { type: 'image/png' }));
+  window.__FL__.setTool('ref');
+  const plane = r.group.children[0];
+  const world = () => {
+    r.group.updateMatrixWorld(true);
+    const b = new THREE.Box3().setFromObject(plane);
+    return b.getSize(new THREE.Vector3());
+  };
+  const loaded = world();
+  r.setSize(20, 10);
+  const sized = world();
+  r.setOrientation('vertical');
+  const vertical = r.getSize();
+  r.setOrientation('horizontal');
+  const horizontal = r.getSize();
+  r.setWidth(30);
+  const afterWidth = r.getSize();
+  r.setHeight(15);
+  const afterHeight = r.getSize();
+  return {
+    loaded: [loaded.x, loaded.z],
+    sized: [sized.x, sized.z],
+    vertical: [vertical.w, vertical.h],
+    horizontal: [horizontal.w, horizontal.h],
+    afterWidth: [afterWidth.w, afterWidth.h],
+    afterHeight: [afterHeight.w, afterHeight.h],
+  };
+});
+ok('ref image preserves its aspect on load',
+  Math.abs(refSize.loaded[0] / refSize.loaded[1] - 2) < 0.02, JSON.stringify(refSize.loaded));
+ok('ref setSize is world-space and orientation round-trips',
+  Math.abs(refSize.sized[0] - 20) < 1e-3 && Math.abs(refSize.sized[1] - 10) < 1e-3 &&
+  Math.abs(refSize.vertical[0] - 20) < 1e-3 && Math.abs(refSize.vertical[1] - 10) < 1e-3 &&
+  Math.abs(refSize.horizontal[0] - 20) < 1e-3 && Math.abs(refSize.horizontal[1] - 10) < 1e-3,
+  JSON.stringify({ sized: refSize.sized, vertical: refSize.vertical, horizontal: refSize.horizontal }));
+ok('ref Width/Height edits are independent',
+  Math.abs(refSize.afterWidth[0] - 30) < 1e-3 && Math.abs(refSize.afterWidth[1] - 10) < 1e-3 &&
+  Math.abs(refSize.afterHeight[0] - 30) < 1e-3 && Math.abs(refSize.afterHeight[1] - 15) < 1e-3,
+  JSON.stringify({ afterWidth: refSize.afterWidth, afterHeight: refSize.afterHeight }));
+
+// Whole-model export normalization: relative placement must survive.
+const exportNorm = await page.evaluate(async () => {
+  const THREE = window.__FL__.THREE;
+  const { buildExportScene } = await import('/src/exporter.ts');
+  const mk = (w, h, d, x) => {
+    const geo = new THREE.BoxGeometry(w, h, d);
+    geo.translate(x, h / 2, 0);
+    const obj = new THREE.Mesh(geo, new THREE.MeshStandardMaterial());
+    return { object: obj, geometry: geo, index: null, triCount: 12, name: 'm' + x };
+  };
+  const scene = buildExportScene([mk(20, 10, 4, 10), mk(10, 10, 10, 40)], true);
+  return scene.children.map((m) => {
+    m.geometry.computeBoundingBox();
+    return +m.geometry.boundingBox.getCenter(new THREE.Vector3()).x.toFixed(4);
+  });
+});
+ok('export normalization keeps multi-mesh relative placement',
+  exportNorm[0] < 0 && exportNorm[1] > 0 &&
+  Math.abs(exportNorm[0] + 0.2778) < 1e-3 && Math.abs(exportNorm[1] - 0.3889) < 1e-3,
+  JSON.stringify(exportNorm));
+
 await page.screenshot({ path: `${ROOT}/.smoke/09-final.png` });
 
 writeFileSync(`${ROOT}/.smoke/results.json`, JSON.stringify(results, null, 2));

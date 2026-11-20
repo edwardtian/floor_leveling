@@ -96,31 +96,43 @@ export class FloorTool {
     this.floorLabel.renderOrder = 6;
     this.editor.overlayGroup.add(this.floorLabel);
 
+    // Keep `settings` a live mirror of the previewed transform, no matter
+    // whether the change came from the gizmo, the Transform sub-panel, or a
+    // numeric field. Otherwise a later updatePlane(true) writes stale sizes
+    // and silently discards the pending scale/translation.
+    this.nodeTransform.addChangeListener(() => this.syncFromGizmo());
+
     this.updatePlane();
   }
 
   private floorLabel: THREE.Sprite;
 
   setActive(v: boolean): void {
+    const was = this.active;
     this.active = v;
     this.planeMesh.visible = v && this.uiVisible;
     this.outline.visible = v && this.uiVisible;
     this.floorRoot.visible = v;
     this.floorLabel.visible = this.planeMesh.visible;
     if (!v) {
-      this.editor.detachGizmo();
-      this.clearHitOverlay();
-      this.areas = [];
-      this.selectedIds.clear();
+      if (was) {
+        this.editor.detachGizmo();
+        this.clearHitOverlay();
+        this.areas = [];
+        this.selectedIds.clear();
+      }
     } else {
       // Auto-fit only on the first activation per model — afterwards the
       // user's placement persists until they change it or import anew.
-      if (this.autoFitPending) {
-        this.fitToModel();
+      // If a pending transform is armed, keep the flag set: fitting now would
+      // silently do nothing (or would have to discard the pending edit).
+      if (this.autoFitPending && this.fitToModel()) {
         this.autoFitPending = false;
       }
       this.nodeTransform.attachGizmo(this.gizmoMode);
-      this.editor.gizmo.showY = this.gizmoMode !== 'scale';
+      // All scale axes stay visible: hiding Y would also hide the XYZ center
+      // cube, i.e. the only uniform-scale handle.
+      this.editor.gizmo.showY = true;
     }
     this.updatePlane();
     this.onChanged();
@@ -129,9 +141,11 @@ export class FloorTool {
   setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
     this.gizmoMode = mode;
     if (this.active) this.nodeTransform.attachGizmo(mode);
-    // Scale mode: the plane has no world-Y extent, so the Y-scale handle is
-    // meaningless — hide it (translate/rotate need all axes).
-    this.editor.gizmo.showY = mode !== 'scale';
+    // Do NOT use showY=false here: TransformControls hides every handle whose
+    // name contains a hidden axis (Y, XY, YZ AND XYZ). The floor is flat, so a
+    // Y scale is harmless, and the XYZ center cube is needed for uniform
+    // scaling of the whole plane.
+    this.editor.gizmo.showY = true;
   }
 
   /** Pending transform of the floor node (live during gizmo drags). */
@@ -145,6 +159,7 @@ export class FloorTool {
 
   /** Bake the pending transform into the floor node (undoable). */
   applyTransform(): boolean {
+    this.normalizeScale();
     const ok = this.nodeTransform.apply();
     if (ok) {
       this.syncFromGizmo();
@@ -158,6 +173,29 @@ export class FloorTool {
     this.nodeTransform.reset();
     this.syncFromGizmo();
     this.onChanged();
+  }
+
+  /** Re-seat the gizmo on the current previewed pivot/orientation. */
+  private refreshGizmo(): void {
+    if (this.active) this.nodeTransform.attachGizmo(this.gizmoMode);
+  }
+
+  /**
+   * A floor plane is symmetric, so a mirrored or zero pending scale is
+   * meaningless and only makes the panel (which shows magnitudes) disagree
+   * with the baked node. Snap the pending scale to positive magnitudes.
+   */
+  normalizeScale(): void {
+    const p = this.nodeTransform.pending;
+    const sx = Math.max(0.01, Math.abs(p.sx));
+    const sy = Math.max(0.01, Math.abs(p.sy));
+    const sz = Math.max(0.01, Math.abs(p.sz));
+    if (sx !== p.sx || sy !== p.sy || sz !== p.sz) {
+      p.sx = sx;
+      p.sy = sy;
+      p.sz = sz;
+      this.nodeTransform.preview();
+    }
   }
 
   /** Rotation of the plane in degrees (Euler XYZ), e.g. tilt/spin fields. */
@@ -185,6 +223,9 @@ export class FloorTool {
     if (x !== undefined) this.floorRoot.rotation.x = THREE.MathUtils.degToRad(x);
     if (y !== undefined) this.floorRoot.rotation.y = THREE.MathUtils.degToRad(y);
     if (z !== undefined) this.floorRoot.rotation.z = THREE.MathUtils.degToRad(z);
+    // Re-capture the base so a pending transform keeps riding on the new
+    // rotation instead of previewing the old base quaternion.
+    this.nodeTransform.refreshBase();
     this.updatePlane();
   }
 
@@ -224,10 +265,20 @@ export class FloorTool {
     this.autoFitPending = true;
   }
 
-  /** Center + size the plane to the model bbox footprint (convenience). */
-  fitToModel(): void {
+  /**
+   * Center + size the plane to the model bbox footprint.
+   * bakePending=true is the explicit "Fit to model" action: fold the pending
+   * transform in first, then write the fit values (so the fit is not lost).
+   * Returns false when a pending transform is armed and baking was not asked
+   * for (the auto-fit on activation then stays armed for a later attempt).
+   */
+  fitToModel(bakePending = false): boolean {
     const mesh = this.getMesh();
-    if (!mesh) return;
+    if (!mesh) return false;
+    if (this.hasPendingTransform()) {
+      if (!bakePending) return false;
+      this.nodeTransform.apply();
+    }
     mesh.geometry.computeBoundingBox();
     const bb = mesh.geometry.boundingBox!;
     const size = bb.getSize(new THREE.Vector3());
@@ -237,6 +288,7 @@ export class FloorTool {
     this.settings.cx = center.x;
     this.settings.cz = center.z;
     this.updatePlane();
+    return true;
   }
 
   /**
@@ -249,6 +301,9 @@ export class FloorTool {
   updatePlane(bakePending = false): void {
     const s = this.settings;
     if (bakePending && this.hasPendingTransform()) {
+      // apply() also syncs `settings` from the baked base via the change
+      // listener, so a stale mirror can never overwrite the pending edit.
+      this.normalizeScale();
       this.nodeTransform.apply();
     }
     if (this.hasPendingTransform()) {
@@ -259,14 +314,20 @@ export class FloorTool {
       return;
     }
     this.floorRoot.position.set(s.cx, s.y, s.cz);
-    this.floorRoot.scale.set(s.sizeX, 1, s.sizeZ);
+    // Preserve Y: a uniform scale (or the Transform sub-panel's Y field) must
+    // survive later base writes. The plane is flat, so Y has no visual effect.
+    this.floorRoot.scale.set(s.sizeX, this.floorRoot.scale.y, s.sizeZ);
     this.nodeTransform.refreshBase();
     this.positionLabel();
     this.floorRoot.updateMatrixWorld(true);
+    // Re-seat the gizmo on the new baked base (Fit / @bottom / passive writes).
+    this.refreshGizmo();
   }
 
   private positionLabel(): void {
-    this.floorLabel.position.copy(this.floorRoot.position);
+    // Follow the PREVIEWED origin, not the baked one (pending translation).
+    const p = this.nodeTransform.previewedTRS().pos;
+    this.floorLabel.position.copy(p);
     this.floorLabel.position.y += 0.02 + this.labelLift;
   }
 

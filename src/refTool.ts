@@ -108,24 +108,23 @@ export class RefTool {
     this.mat.map = tex;
     this.mat.needsUpdate = true;
 
-    // Size the plane to the image aspect, defaulting to a useful size relative
-    // to the model (about 60% of its footprint), centered on the model.
+    // One square plane; the world size lives entirely in the group scale.
+    // (Previously the aspect was baked into the geometry AND into scale.z,
+    // so a 2:1 image rendered at 4:1 and the Height field was off by 2×.)
     const aspect = (tex.image?.width ?? 1) / (tex.image?.height ?? 1);
     this.baseW = 1;
-    this.baseH = 1 / Math.max(aspect, 1e-6);
+    this.baseH = 1;
     this.plane.geometry.dispose();
-    this.plane.geometry = new THREE.PlaneGeometry(this.baseW, this.baseH);
+    this.plane.geometry = new THREE.PlaneGeometry(1, 1);
+    this.plane.rotation.x = -Math.PI / 2; // fresh images start horizontal
 
     let footprint = 2;
-    let centerY = 0;
     let minY = 0;
     this.editor.modelRoot.updateMatrixWorld(true);
     const box = new THREE.Box3().setFromObject(this.editor.modelRoot);
     if (!box.isEmpty()) {
       const size = box.getSize(new THREE.Vector3());
-      const center = box.getCenter(new THREE.Vector3());
       footprint = Math.max(size.x, size.z);
-      centerY = center.y;
       minY = box.min.y;
     }
     const w = footprint * 0.6;
@@ -134,6 +133,7 @@ export class RefTool {
     this.group.position.set(0, minY + 0.01, 0);
     this.group.rotation.y = 0;
     this.group.visible = true;
+    this.group.updateMatrixWorld(true);
     this.nodeTransform.setTarget(this.group); // fresh base, no pending
     this.onChanged();
   }
@@ -145,7 +145,7 @@ export class RefTool {
     this.mat.needsUpdate = true;
     this.imageName = '';
     this.group.visible = false;
-    this.editor.detachGizmo();
+    if (this.active) this.editor.detachGizmo();
     this.onChanged();
   }
 
@@ -170,23 +170,38 @@ export class RefTool {
   }
 
   setSize(width: number, height: number): void {
+    // A zero dimension collapses the plane and breaks the scale inverse.
+    width = Math.max(1e-4, width);
+    height = Math.max(1e-4, height);
     const o = this.getOrientation();
     if (o === 'horizontal') {
-      this.nodeTransform.setWorldScale({ x: width, z: height });
+      this.nodeTransform.setWorldScale({ x: width / this.baseW, z: height / this.baseH });
     } else {
-      this.nodeTransform.setWorldScale({ x: width, y: height });
+      this.nodeTransform.setWorldScale({ x: width / this.baseW, y: height / this.baseH });
     }
     this.onChanged();
   }
 
-  /** Current world-space size (width × height in meters). */
+  /** Width-only edit: preserves the CURRENT height (not a build-time snapshot). */
+  setWidth(width: number): void {
+    const { h } = this.getSize();
+    this.setSize(width, h);
+  }
+
+  /** Height-only edit: preserves the CURRENT width (not a build-time snapshot). */
+  setHeight(height: number): void {
+    const { w } = this.getSize();
+    this.setSize(w, height);
+  }
+
+  /** Current local size (width × height in meters), independent of spin. */
   getSize(): { w: number; h: number } {
-    if (this.hasPendingTransform()) this.group.updateMatrixWorld(true);
-    else this.group.updateMatrix();
-    const box = new THREE.Box3().setFromObject(this.plane);
-    const s = box.getSize(new THREE.Vector3());
+    const s = this.nodeTransform.previewedTRS().scale;
     const o = this.getOrientation();
-    return o === 'horizontal' ? { w: s.x, h: s.z } : { w: s.x, h: s.y };
+    return {
+      w: this.baseW * Math.abs(s.x),
+      h: this.baseH * Math.abs(o === 'horizontal' ? s.z : s.y),
+    };
   }
 
   /**
@@ -209,12 +224,16 @@ export class RefTool {
   }
 
   get state(): { x: number; y: number; z: number; angleDeg: number; w: number; h: number } {
+    // Read the PREVIEWED TRS: after a gizmo drag the base TRS is untouched
+    // (the preview is a matrix override), so reading group.position/rotation
+    // would show stale values in the panel.
+    const trs = this.nodeTransform.previewedTRS();
     const size = this.getSize();
     return {
-      x: this.group.position.x,
-      y: this.group.position.y,
-      z: this.group.position.z,
-      angleDeg: THREE.MathUtils.radToDeg(this.group.rotation.y),
+      x: trs.pos.x,
+      y: trs.pos.y,
+      z: trs.pos.z,
+      angleDeg: THREE.MathUtils.radToDeg(trs.rotDeg.y),
       w: size.w,
       h: size.h,
     };
