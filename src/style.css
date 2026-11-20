@@ -107,3 +107,68 @@ input[type="file"] { color: var(--fg-dim); font-size: 11.5px; max-width: 200px; 
 }
 #toast.err { border-color: var(--danger); color: #ffb0b0; }
 #toast.ok { border-color: var(--accent2); color: #b8f0cd; }
+
+/* ---------- navigation gizmo (own overlay space, top-right) ---------- */
+
+.navgizmo {
+  position: absolute;
+  top: 46px;
+  right: 283px; /* panel width + margin; kept in sync from navGizmo */
+  width: 96px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 5px;
+  pointer-events: none; /* container is click-through … */
+  z-index: 18;
+  user-select: none;
+}
+.navgizmo canvas {
+  width: 96px;
+  height: 96px;
+  pointer-events: auto; /* … the gizmo circle itself is interactive */
+  cursor: grab;
+  display: block;
+}
+.navgizmo-btns {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  pointer-events: auto;
+}
+.navgizmo-btn {
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(35, 37, 41, 0.85);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  padding: 0;
+}
+.navgizmo-btn:hover {
+  background: var(--bg3);
+  color: var(--fg);
+  border-color: #4a4f58;
+}
+.navgizmo-viewlabel {
+  font-size: 10.5px;
+  color: rgba(216, 219, 224, 0.55);
+  white-space: nowrap;
+}
+.navgizmo-tooltip {
+  position: absolute;
+  right: 104px;
+  top: 40px;
+  background: rgba(35, 37, 41, 0.92);
+  border: 1px solid var(--border);
+  color: var(--fg);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  pointer-events: none;
+  white-space: nowrap;
+}

@@ -4,7 +4,17 @@ import * as THREE from 'three';
 export type MeasurementUnits = 'meter' | 'centimeter';
 
 /** A tool identifier. */
-export type ToolId = 'select' | 'transform' | 'segment' | 'floor' | 'ref';
+export type ToolId = 'select' | 'transform' | 'ffd' | 'floor' | 'ref';
+
+/** Free-Form Deformation lattice settings (3ds Max FFD box style). */
+export interface FFDSettings {
+  /** Control points along X / Y / Z (≥2 each). */
+  nx: number;
+  ny: number;
+  nz: number;
+  /** Extra lattice margin around the mesh bbox (fraction of bbox size, 0..0.5). */
+  margin: number;
+}
 
 export type SegAxis = 'x' | 'y' | 'z';
 

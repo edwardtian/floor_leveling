@@ -5,7 +5,7 @@ import { History } from './history';
 import { importModel } from './importer';
 import { exportModel } from './exporter';
 import { TransformTool } from './transformTool';
-import { SegmentTool } from './segmentTool';
+import { FFDTool } from './ffdTool';
 import { FloorTool } from './floorTool';
 import { RefTool } from './refTool';
 import type { MeshData, MeasurementUnits, ToolId } from './types';
@@ -29,22 +29,29 @@ let currentTool: ToolId = 'select';
 let units: MeasurementUnits = 'meter';
 let importedFileName = '';
 let unitRefreshers: (() => void)[] = [];
+/** Syncs numeric floor fields from the tool state (called on gizmo drags). */
+let floorTransformSyncers: (() => void)[] = [];
 
 const transformTool = new TransformTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
-const segmentTool = new SegmentTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
+const ffdTool = new FFDTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
 const floorTool = new FloorTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
 const refTool = new RefTool(editor, refreshAll);
 
 editor.addGizmoDragStartListener(() => {
-  if (currentTool === 'segment') segmentTool.beginGizmoDrag();
+  if (currentTool === 'ffd') ffdTool.beginGizmoDrag();
 });
 editor.addGizmoDragEndListener(() => {
-  if (currentTool === 'segment') segmentTool.endGizmoDrag();
+  if (currentTool === 'ffd') ffdTool.endGizmoDrag();
+  if (currentTool === 'floor') floorTool.syncFromGizmo(); // clamp scale, mirror settings
   if (currentTool === 'transform') return; // TransformTool has its own listener
 });
 editor.gizmo.addEventListener('objectChange', () => {
-  if (currentTool === 'segment' && segmentTool.handlesGizmo(editor.gizmo.object as THREE.Object3D)) {
-    segmentTool.updateGizmoDrag();
+  if (currentTool === 'ffd' && ffdTool.handlesGizmo(editor.gizmo.object as THREE.Object3D)) {
+    ffdTool.updateGizmoDrag();
+  }
+  if (currentTool === 'floor' && editor.gizmo.object === floorTool.planeVisuals.plane.parent) {
+    floorTool.syncFromGizmo(); // live-update numeric fields during the drag
+    for (const fn of floorTransformSyncers) fn();
   }
 });
 
@@ -85,8 +92,7 @@ async function importFromFile(file: File): Promise<void> {
   try {
     setStatus(`Importing ${file.name}…`);
     setTool('select');
-    segmentTool.clearOverlay();
-    segmentTool.segmentation = null;
+    ffdTool.invalidate(); // new model → old lattice is meaningless
     floorTool.clearHitOverlay();
     floorTool.areas = [];
     floorTool.selectedIds.clear();
@@ -177,18 +183,18 @@ function setTool(id: ToolId): void {
   currentTool = id;
 
   transformTool.setActive(id === 'transform');
-  segmentTool.setActive(id === 'segment');
+  ffdTool.setActive(id === 'ffd');
   floorTool.setActive(id === 'floor');
   refTool.setActive(id === 'ref');
 
   // Left-drag meaning per tool.
   editor.setLeftButtonOrbit(id === 'select' || id === 'transform' || id === 'ref');
-  if (id !== 'transform' && id !== 'ref') editor.detachGizmo();
+  if (id !== 'transform' && id !== 'ref' && id !== 'floor' && id !== 'ffd') editor.detachGizmo();
 
   for (const [toolId, btnId] of [
     ['select', 'tool-select'],
     ['transform', 'tool-transform'],
-    ['segment', 'tool-segment'],
+    ['ffd', 'tool-ffd'],
     ['floor', 'tool-floor'],
     ['ref', 'tool-ref'],
   ] as const) {
@@ -208,7 +214,7 @@ function setTool(id: ToolId): void {
 for (const [toolId, btnId] of [
   ['select', 'tool-select'],
   ['transform', 'tool-transform'],
-  ['segment', 'tool-segment'],
+  ['ffd', 'tool-ffd'],
   ['floor', 'tool-floor'],
   ['ref', 'tool-ref'],
 ] as const) {
@@ -250,7 +256,7 @@ function doRedo(): void {
 }
 
 function afterHistoryJump(label: string): void {
-  segmentTool.repaint();
+  ffdTool.repaint();
   if (floorTool.active && floorTool.areas.length) floorTool.scan();
   transformTool.preview();
   refreshAll();
@@ -277,7 +283,7 @@ let additiveDown = false;
 editor.renderer.domElement.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   if ((editor.gizmo as any).axis) return; // gizmo handles it
-  if (currentTool !== 'segment' && currentTool !== 'floor') return;
+  if (currentTool !== 'ffd' && currentTool !== 'floor') return;
   pointerTracking = true;
   additiveDown = e.shiftKey;
   pointerDownNdc = editor.ndcFromEvent(e);
@@ -292,38 +298,36 @@ editor.renderer.domElement.addEventListener('pointerup', (e) => {
   if (!pointerTracking) return;
   pointerTracking = false;
   const rect = editor.endRect(e);
-  if (currentTool === 'segment') handleSegmentPointerUp(rect, e);
+  if (currentTool === 'ffd') handleFFDPointerUp(rect, e);
   else if (currentTool === 'floor') handleFloorPointerUp(rect, e);
 });
 
-function handleSegmentPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEvent): void {
-  if (!segmentTool.segmentation) {
-    toast('Build a segmentation first (set N×M and press Rebuild).');
+function handleFFDPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEvent): void {
+  if (!ffdTool.lattice) {
+    toast('Build the FFD lattice first (press "Create lattice").');
     return;
   }
   if (rect) {
-    const ids = segmentTool.segmentsInRect(rect);
-    segmentTool.select(ids, additiveDown);
+    const ids = ffdTool.pointsInRect(rect);
+    ffdTool.select(ids, additiveDown);
     if (ids.length) {
-      segmentTool.attachSelectionGizmo();
-      toast(`${ids.length} segment(s) selected — drag the gizmo to move/scale (smooth falloff at borders).`);
+      toast(`${ids.length} control point(s) selected — drag the gizmo to deform.`);
     }
   } else {
-    const hit = segmentTool.segmentAt(pointerDownNdc);
-    if (hit) {
-      const cur = segmentTool.segmentation!.selected;
-      if (additiveDown && cur.has(hit.segmentId)) cur.delete(hit.segmentId);
-      else if (additiveDown) cur.add(hit.segmentId);
+    const id = ffdTool.pointAt(pointerDownNdc);
+    if (id >= 0) {
+      const cur = ffdTool.selected;
+      if (additiveDown && cur.has(id)) cur.delete(id);
+      else if (additiveDown) cur.add(id);
       else {
         cur.clear();
-        cur.add(hit.segmentId);
+        cur.add(id);
       }
-      segmentTool.repaint();
-      segmentTool.attachSelectionGizmo();
+      ffdTool.repaint();
+      ffdTool.attachSelectionGizmo();
       refreshAll();
     } else if (!additiveDown) {
-      segmentTool.clearSelection();
-      editor.detachGizmo();
+      ffdTool.clearSelection();
     }
   }
 }
@@ -371,7 +375,7 @@ function buildPanel(): void {
   switch (currentTool) {
     case 'select': buildSelectPanel(); break;
     case 'transform': buildTransformPanel(); break;
-    case 'segment': buildSegmentPanel(); break;
+    case 'ffd': buildFFDPanel(); break;
     case 'floor': buildFloorPanel(); break;
     case 'ref': buildRefPanel(); break;
   }
@@ -410,7 +414,7 @@ function buildSelectPanel(): void {
   gu.body.appendChild(hint('Scene space is meters. Labels on the grid ruler follow this setting.'));
   const gh = group('Workflow', panelBody);
   gh.body.appendChild(hint(
-    '1 Import → 2 Transform (rotate/apply) → 3 Segment → 4 Floor plane → ' +
+    '1 Import → 2 Transform (rotate/apply) → 3 FFD (free-form deform) → 4 Floor plane → ' +
     '5 Scan intersections → 6 Drop/Flatten → repeat. Ctrl+Z undo.',
   ));
 }
@@ -422,8 +426,7 @@ function switchActiveMesh(i: number): void {
     toast('Pending transform discarded (mesh switched).');
   }
   activeMeshIndex = i;
-  segmentTool.segmentation = null;
-  segmentTool.clearOverlay();
+  ffdTool.invalidate(); // rest positions captured for another mesh
   floorTool.areas = [];
   floorTool.clearHitOverlay();
   editor.frameModel();
@@ -496,65 +499,69 @@ function gizmoModeButtons(setMode: (m: 'translate' | 'rotate' | 'scale') => void
   return row;
 }
 
-function buildSegmentPanel(): void {
-  panelTitle.textContent = 'Segments (N×M)';
+function buildFFDPanel(): void {
+  panelTitle.textContent = 'Free-Form Deformation (FFD)';
   if (!meshes.length) {
     panelBody.appendChild(hint('Import a model first.'));
     return;
   }
-  const s = segmentTool.settings;
+  const s = ffdTool.settings;
 
-  const gg = group('Grid', panelBody);
-  gg.body.appendChild(
-    selectField('Axis A', [
-      { value: 'x', label: 'X' }, { value: 'y', label: 'Y' }, { value: 'z', label: 'Z' },
-    ], s.axisA, (v) => { s.axisA = v as any; rebuildSegments(); }).root,
-  );
-  gg.body.appendChild(
-    selectField('Axis B', [
-      { value: 'x', label: 'X' }, { value: 'y', label: 'Y' }, { value: 'z', label: 'Z' },
-    ], s.axisB, (v) => { s.axisB = v as any; rebuildSegments(); }).root,
-  );
-  gg.body.appendChild(numField('Count A', s.countA, (v) => { s.countA = Math.max(1, Math.round(v)); rebuildSegments(); }, { integer: true, min: 1, max: 40 }));
-  gg.body.appendChild(numField('Count B', s.countB, (v) => { s.countB = Math.max(1, Math.round(v)); rebuildSegments(); }, { integer: true, min: 1, max: 40 }));
+  const gl = group('Lattice', panelBody);
+  const rowDim = el('div', 'row');
+  rowDim.appendChild(numField('X', s.nx, (v) => { s.nx = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20 }));
+  rowDim.appendChild(numField('Y', s.ny, (v) => { s.ny = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20 }));
+  rowDim.appendChild(numField('Z', s.nz, (v) => { s.nz = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20 }));
+  gl.body.appendChild(rowDim);
+  gl.body.appendChild(slider('Cage margin', s.margin, 0, 0.3, 0.01, (v) => { s.margin = v; if (ffdTool.lattice) rebuildFFD(); }));
+  const rowL = el('div', 'row');
+  rowL.appendChild(button(ffdTool.lattice ? 'Rebuild lattice' : 'Create lattice', () => rebuildFFD(), 'btn primary'));
+  rowL.appendChild(button('Reset', () => { ffdTool.reset(); toast('Lattice reset to the rest cage.', 'ok'); }));
+  rowL.appendChild(button('Collapse', () => { ffdTool.collapse(); toast('Lattice removed — shape stays as deformed.', 'ok'); }));
+  gl.body.appendChild(rowL);
+  gl.body.appendChild(hint('The lattice wraps the whole model. Click control points to select (Shift = add), drag on empty space for a rect, then drag the gizmo: the surface deforms smoothly.'));
 
-  const gf = group('Falloff', panelBody);
-  gf.body.appendChild(slider('Blend', s.falloffRatio, 0, 0.6, 0.05, (v) => {
-    s.falloffRatio = v;
-    if (segmentTool.segmentation) rebuildSegments();
-  }));
-  gf.body.appendChild(hint('0 = hard cell borders; higher = smoother transition between segments.'));
-
-  const gsel = group('Selection', panelBody);
+  const gs = group('Selection', panelBody);
   const info = el('div', 'hint', '');
-  info.id = 'seg-info';
-  gsel.body.appendChild(info);
+  info.id = 'ffd-info';
+  gs.body.appendChild(info);
   const rowBtns = el('div', 'row');
-  const allBtn = button('All', () => { segmentTool.selectAll(); segmentTool.attachSelectionGizmo(); });
-  const noneBtn = button('None', () => { segmentTool.clearSelection(); editor.detachGizmo(); });
-  rowBtns.append(allBtn, noneBtn);
-  gsel.body.appendChild(rowBtns);
-  gsel.body.appendChild(gizmoModeButtons((m) => segmentTool.setGizmoMode(m), segmentTool['gizmoMode']));
-  gsel.body.appendChild(hint('Click a colored cell to select (Shift = add). Drag on empty space for a rect multi-select. Then drag the gizmo: the whole block moves rigidly, edges blend smoothly.'));
+  rowBtns.appendChild(button('All', () => { ffdTool.selectAll(); }));
+  rowBtns.appendChild(button('None', () => { ffdTool.clearSelection(); }));
+  rowBtns.appendChild(button('Corners', () => selectFFDCorners()));
+  gs.body.appendChild(rowBtns);
+  gs.body.appendChild(gizmoModeButtons((m) => ffdTool.setGizmoMode(m), ffdTool.gizmoMode));
 
-  refreshSegInfo();
+  refreshFFDInfo();
 }
 
-function rebuildSegments(): void {
-  const r = segmentTool.rebuild();
-  if (r) toast(`Segmented into ${segmentTool.segCount} cells.`, 'ok');
-  refreshSegInfo();
+function selectFFDCorners(): void {
+  const lat = ffdTool.lattice;
+  if (!lat) return;
+  const ids: number[] = [];
+  for (const i of [0, lat.nx - 1]) {
+    for (const j of [0, lat.ny - 1]) {
+      for (const k of [0, lat.nz - 1]) ids.push(lat.index(i, j, k));
+    }
+  }
+  ffdTool.select(ids, false);
 }
 
-function refreshSegInfo(): void {
-  const info = document.getElementById('seg-info');
+function rebuildFFD(): void {
+  if (ffdTool.build()) {
+    toast(`FFD lattice ${ffdTool.settings.nx}×${ffdTool.settings.ny}×${ffdTool.settings.nz} created.`, 'ok');
+  }
+  refreshFFDInfo();
+}
+
+function refreshFFDInfo(): void {
+  const info = document.getElementById('ffd-info');
   if (!info) return;
-  const seg = segmentTool.segmentation;
-  if (!seg) {
-    info.textContent = 'No segmentation yet.';
+  const lat = ffdTool.lattice;
+  if (!lat) {
+    info.textContent = 'No lattice yet.';
   } else {
-    const owned = seg.segments.filter((s) => s.triangles.length > 0).length;
-    info.textContent = `${owned} cells · ${seg.selected.size} selected · falloff band ${seg.falloffHops} edge-hops.`;
+    info.textContent = `${lat.nx}×${lat.ny}×${lat.nz} = ${lat.count} control points · ${ffdTool.selected.size} selected.`;
   }
 }
 
@@ -567,13 +574,22 @@ function buildFloorPanel(): void {
   const s = floorTool.settings;
 
   const gp = group('Floor plane', panelBody);
+  gp.body.appendChild(gizmoModeButtons((m) => floorTool.setGizmoMode(m), floorTool.gizmoMode));
+
+  // Fields re-read floorTool.settings on refresh so gizmo drags live-update them.
   const fx = unitField('Width X', s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); floorTool.updatePlane(); });
   const fz = unitField('Depth Z', s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); floorTool.updatePlane(); });
   const fy = unitField('Height Y', s.y, () => units, (v) => { s.y = v; floorTool.updatePlane(); });
   const fcx = unitField('Center X', s.cx, () => units, (v) => { s.cx = v; floorTool.updatePlane(); });
   const fcz = unitField('Center Z', s.cz, () => units, (v) => { s.cz = v; floorTool.updatePlane(); });
+  const rot = numField('Spin / tilt (deg)', floorTool.rotationDeg.y, (v) => floorTool.setRotationDeg(undefined, v, undefined), { step: 1 });
+  const sync = () => {
+    fx.set(s.sizeX); fz.set(s.sizeZ); fy.set(s.y); fcx.set(s.cx); fcz.set(s.cz);
+    (rot.querySelector('input') as HTMLInputElement).value = String(Math.round(floorTool.rotationDeg.y));
+  };
+  floorTransformSyncers.push(sync);
   unitRefreshers.push(fx.refresh, fz.refresh, fy.refresh, fcx.refresh, fcz.refresh);
-  gp.body.append(fx.root, fz.root, fy.root, fcx.root, fcz.root);
+  gp.body.append(fx.root, fz.root, fy.root, fcx.root, fcz.root, rot);
 
   const rowFit = el('div', 'row');
   const fitBtn = button('Fit to model', () => { floorTool.fitToModel(); buildPanel(); });
@@ -586,7 +602,7 @@ function buildFloorPanel(): void {
   });
   rowFit.append(fitBtn, bottomBtn);
   gp.body.appendChild(rowFit);
-  gp.body.appendChild(hint('Resize/move the plane so it overlaps the parts you want level.'));
+  gp.body.appendChild(hint('Drag the gizmo in the viewport to move / rotate / scale the plane (T/R/S above switch the mode).'));
 
   const gscan = group('Intersections', panelBody);
   const scanBtn = button('Scan intersections', () => {
@@ -700,12 +716,13 @@ function refreshAll(): void {
     parts.push(`${fmtNumber(totalTriangles(meshes))} tris · ${formatBox(sceneBox(meshes), units)}`);
   }
   if (transformTool.hasPending) parts.push('⚠ pending transform (not applied)');
-  if (segmentTool.segmentation) parts.push(`segments: ${segmentTool.segmentation.selected.size}/${segmentTool.segCount} selected`);
+  if (ffdTool.lattice) parts.push(`FFD: ${ffdTool.selected.size}/${ffdTool.lattice.count} points selected`);
   if (floorTool.areas.length) parts.push(`floor areas: ${floorTool.areas.length} (${floorTool.selectedAreas.size} selected)`);
   if (parts.length) setStatus(parts.join('  ·  '));
-  const segInfo = document.getElementById('seg-info');
-  if (segInfo && segmentTool.segmentation) {
-    segInfo.textContent = `${segmentTool.segCount} cells · ${segmentTool.segmentation.selected.size} selected · falloff band ${segmentTool.segmentation.falloffHops} edge-hops.`;
+  const ffdInfo = document.getElementById('ffd-info');
+  if (ffdInfo) {
+    const lat = ffdTool.lattice;
+    ffdInfo.textContent = lat ? `${lat.nx}×${lat.ny}×${lat.nz} = ${lat.count} control points · ${ffdTool.selected.size} selected.` : 'No lattice yet.';
   }
 }
 
@@ -726,7 +743,7 @@ import * as THREE_NS from 'three';
   history,
   editor,
   transformTool,
-  segmentTool,
+  ffdTool,
   floorTool,
   refTool,
   setTool,

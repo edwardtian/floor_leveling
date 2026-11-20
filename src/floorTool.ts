@@ -1,22 +1,27 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
 import type { MeshData, FloorSettings } from './types';
-import { intersectFloorPlane, dropToPlane, flattenToPlane } from './leveling';
+import { intersectFloorPlane, dropToPlane, flattenToPlane, type FloorFrame } from './leveling';
 import { selectionFalloff, weldedVertexWeights } from './falloff';
-import { getAdjacency } from './segmentUtils';
+import { getAdjacency } from './falloff';
 import { makeTextSprite } from './editor';
 import type { History } from './history';
 
 /**
- * Floor tool (R5–R7): a resizable XZ plane; detect mesh faces crossing/below
- * it inside its footprint; highlight connected intersection areas; select one
- * (or several via rect) and level them: rigid "drop" or "flatten" onto the
- * plane, blended with a smooth falloff at the region border.
+ * Floor tool (R5–R7): a resizable/movable/rotatable plane; detect mesh faces
+ * crossing/below it inside its footprint; highlight connected intersection
+ * areas; select one (or several via rect) and level them: rigid "drop" or
+ * "flatten" onto the plane, blended with a smooth falloff at the region
+ * border. The plane carries a full transform (Translate/Rotate/Scale gizmo) —
+ * a tilted plane levels along its own normal.
  */
 export class FloorTool {
   active = false;
 
   settings: FloorSettings = { sizeX: 2, sizeZ: 2, y: 0, cx: 0, cz: 0 };
+
+  /** Current gizmo mode for the floor plane. */
+  gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
 
   /** Triangle sets of the latest intersection scan (connected areas). */
   areas: { id: number; triangles: number[]; set: Set<number>; minY: number; maxY: number; count: number }[] = [];
@@ -31,6 +36,8 @@ export class FloorTool {
   private getMesh: () => MeshData | null;
   private onChanged: () => void;
 
+  /** Transform carrier — the TransformControls attach target. */
+  private floorRoot: THREE.Group;
   private planeMesh: THREE.Mesh;
   private outline: THREE.LineSegments;
 
@@ -49,6 +56,10 @@ export class FloorTool {
     this.getMesh = getMesh;
     this.onChanged = onChanged;
 
+    this.floorRoot = new THREE.Group();
+    this.floorRoot.name = 'FloorPlane';
+    this.editor.overlayGroup.add(this.floorRoot);
+
     const planeMat = new THREE.MeshBasicMaterial({
       color: 0x2fb9b9,
       transparent: true,
@@ -57,21 +68,23 @@ export class FloorTool {
       depthWrite: false,
     });
     this.planeMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), planeMat);
-    this.planeMesh.rotation.x = -Math.PI / 2;
+    this.planeMesh.rotation.x = -Math.PI / 2; // plane local +Y = floor depth axis
     this.planeMesh.renderOrder = 2;
     this.planeMesh.raycast = () => {};
-    this.editor.overlayGroup.add(this.planeMesh);
+    this.floorRoot.add(this.planeMesh);
 
     const og = new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1));
     this.outline = new THREE.LineSegments(og, new THREE.LineBasicMaterial({ color: 0x2fb9b9, transparent: true, opacity: 0.9 }));
     this.outline.rotation.x = -Math.PI / 2;
     this.outline.renderOrder = 3;
     this.outline.raycast = () => {};
-    this.editor.overlayGroup.add(this.outline);
+    this.floorRoot.add(this.outline);
 
     this.floorLabel = makeTextSprite('floor', 0x2fb9b9, new THREE.Vector3(0, 0, 0), 0.22);
     this.floorLabel.renderOrder = 6;
     this.editor.overlayGroup.add(this.floorLabel);
+
+    this.updatePlane();
   }
 
   private floorLabel: THREE.Sprite;
@@ -80,16 +93,61 @@ export class FloorTool {
     this.active = v;
     this.planeMesh.visible = v && this.uiVisible;
     this.outline.visible = v && this.uiVisible;
+    this.floorRoot.visible = v;
     this.floorLabel.visible = this.planeMesh.visible;
     if (!v) {
+      this.editor.detachGizmo();
       this.clearHitOverlay();
       this.areas = [];
       this.selectedIds.clear();
     } else {
       this.fitToModel();
+      this.editor.attachGizmo(this.floorRoot, this.gizmoMode, 'world');
+      this.editor.gizmo.showY = this.gizmoMode !== 'scale';
     }
     this.updatePlane();
     this.onChanged();
+  }
+
+  setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
+    this.gizmoMode = mode;
+    if (this.active) this.editor.attachGizmo(this.floorRoot, mode, 'world');
+    // Scale mode: the plane has no world-Y extent, so the Y-scale handle is
+    // meaningless — hide it (translate/rotate need all axes).
+    this.editor.gizmo.showY = mode !== 'scale';
+  }
+
+  /** Rotation of the plane in degrees (Euler XYZ), e.g. tilt/spin fields. */
+  get rotationDeg(): { x: number; y: number; z: number } {
+    return {
+      x: THREE.MathUtils.radToDeg(this.floorRoot.rotation.x),
+      y: THREE.MathUtils.radToDeg(this.floorRoot.rotation.y),
+      z: THREE.MathUtils.radToDeg(this.floorRoot.rotation.z),
+    };
+  }
+
+  setRotationDeg(x?: number, y?: number, z?: number): void {
+    if (x !== undefined) this.floorRoot.rotation.x = THREE.MathUtils.degToRad(x);
+    if (y !== undefined) this.floorRoot.rotation.y = THREE.MathUtils.degToRad(y);
+    if (z !== undefined) this.floorRoot.rotation.z = THREE.MathUtils.degToRad(z);
+    this.updatePlane();
+  }
+
+  /**
+   * Read back the transform after gizmo interaction: settings mirror the
+   * floorRoot transform (scale clamped positive), label repositioned.
+   * Cheap enough to call on every objectChange during a drag.
+   */
+  syncFromGizmo(): void {
+    const s = this.settings;
+    s.cx = this.floorRoot.position.x;
+    s.y = this.floorRoot.position.y;
+    s.cz = this.floorRoot.position.z;
+    s.sizeX = Math.max(0.05, this.floorRoot.scale.x);
+    s.sizeZ = Math.max(0.05, this.floorRoot.scale.z);
+    this.floorRoot.scale.x = s.sizeX;
+    this.floorRoot.scale.z = s.sizeZ;
+    this.positionLabel();
   }
 
   /** Center + size the plane to the model bbox footprint (convenience). */
@@ -109,13 +167,44 @@ export class FloorTool {
 
   updatePlane(): void {
     const s = this.settings;
-    this.planeMesh.scale.set(s.sizeX, s.sizeZ, 1);
-    this.planeMesh.position.set(s.cx, s.y, s.cz);
-    this.outline.scale.set(s.sizeX, s.sizeZ, 1);
-    this.outline.position.set(s.cx, s.y, s.cz);
-    this.floorLabel.position.set(s.cx, s.y + 0.02, s.cz);
-    this.floorLabel.visible = this.planeMesh.visible;
-    this.planeMesh.updateMatrixWorld(true);
+    this.floorRoot.position.set(s.cx, s.y, s.cz);
+    this.floorRoot.scale.set(s.sizeX, 1, s.sizeZ);
+    this.positionLabel();
+    this.floorRoot.updateMatrixWorld(true);
+  }
+
+  private positionLabel(): void {
+    this.floorLabel.position.copy(this.floorRoot.position);
+    this.floorLabel.position.y += 0.02 + this.labelLift;
+  }
+
+  /** Label lift so the sprite stays readable for large planes. */
+  private get labelLift(): number {
+    return Math.max(0.1, Math.min(this.settings.sizeX, this.settings.sizeZ) * 0.06);
+  }
+
+  /**
+   * World-space frame of the plane (normal, center, axes, extents) derived
+   * from floorRoot's world matrix — the single source of truth for the
+   * leveling math, valid for tilted planes too.
+   */
+  frame(): FloorFrame {
+    this.floorRoot.updateMatrixWorld(true);
+    const q = new THREE.Quaternion();
+    this.floorRoot.matrixWorld.decompose(new THREE.Vector3(), q, new THREE.Vector3());
+    const normal = new THREE.Vector3(0, 1, 0).applyQuaternion(q).normalize();
+    const xAxis = new THREE.Vector3(1, 0, 0).applyQuaternion(q).normalize();
+    const zAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(q).normalize();
+    const worldScale = new THREE.Vector3();
+    this.floorRoot.matrixWorld.decompose(new THREE.Vector3(), new THREE.Quaternion(), worldScale);
+    return {
+      normal,
+      point: this.floorRoot.getWorldPosition(new THREE.Vector3()),
+      xAxis,
+      zAxis,
+      halfX: Math.max(0.05, Math.abs(worldScale.x)) / 2,
+      halfZ: Math.max(0.05, Math.abs(worldScale.z)) / 2,
+    };
   }
 
   // ---------- intersection scan (R6) ----------
@@ -123,12 +212,8 @@ export class FloorTool {
   scan(): number {
     const mesh = this.getMesh();
     if (!mesh) return 0;
-    const s = this.settings;
-    const res = intersectFloorPlane(
-      mesh, s.y,
-      s.cx - s.sizeX / 2, s.cx + s.sizeX / 2,
-      s.cz - s.sizeZ / 2, s.cz + s.sizeZ / 2,
-    );
+    const frame = this.frame();
+    const res = intersectFloorPlane(mesh, frame);
     this.lastScanMeshUuid = mesh.object.uuid;
 
     // Connected components over adjacency within the intersecting set.
@@ -307,7 +392,7 @@ export class FloorTool {
     const sel = this.areas.filter((a) => this.selectedIds.has(a.id)).flatMap((a) => a.triangles);
     if (sel.length === 0) return false;
 
-    const planeY = this.settings.y;
+    const frame = this.frame();
     const adj = getAdjacency(mesh);
     // Smooth band ~ proportional to region size; welded across duplicate verts.
     const band = Math.max(2, Math.round(Math.sqrt(sel.length / Math.PI) * 0.25));
@@ -318,9 +403,9 @@ export class FloorTool {
     const before = new Float32Array(pos.array as Float32Array);
 
     if (mode === 'drop') {
-      dropToPlane(mesh, sel, planeY, vw);
+      dropToPlane(mesh, sel, frame, vw);
     } else {
-      flattenToPlane(mesh, sel, planeY, vw);
+      flattenToPlane(mesh, sel, frame, vw);
     }
 
     const after = new Float32Array(pos.array as Float32Array);

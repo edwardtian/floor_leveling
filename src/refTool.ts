@@ -52,11 +52,15 @@ export class RefTool {
   }
 
   setActive(v: boolean): void {
+    const was = this.active;
     this.active = v;
     if (v && this.hasImage) {
       this.editor.attachGizmo(this.group, this.gizmoMode, 'world');
       this.syncFields();
-    } else {
+    } else if (!v && was) {
+      // Detach only on the active→inactive transition: other tools own the
+      // gizmo while they are active, and setActive(false) runs for every
+      // tool switch.
       this.editor.detachGizmo();
     }
     this.onChanged();

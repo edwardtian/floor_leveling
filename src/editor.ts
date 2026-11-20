@@ -3,6 +3,7 @@ import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
 import type { MeasurementUnits } from './types';
 import { METER_TO_UNIT } from './units';
+import { NavigationGizmo } from './navGizmo';
 
 /**
  * The three.js core: renderer, camera, orbit, gizmo, grid ruler with meter
@@ -13,8 +14,12 @@ export class Editor {
   dom: HTMLElement;
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
-  camera: THREE.PerspectiveCamera;
+  /** Active camera (perspective or orthographic — swapped by toggleProjection). */
+  camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
+  perspCamera: THREE.PerspectiveCamera;
+  orthoCamera: THREE.OrthographicCamera;
   orbit: OrbitControls;
+  navGizmo: NavigationGizmo;
 
   modelRoot = new THREE.Group();
   overlayGroup = new THREE.Group();
@@ -39,11 +44,21 @@ export class Editor {
   units: MeasurementUnits = 'meter';
 
   private raycaster = new THREE.Raycaster();
+  /** Shared raycaster for tools (FFD control-point picking). */
+  get ray(): THREE.Raycaster {
+    return this.raycaster;
+  }
+  /** Canvas CSS size (used by screen-space helpers). */
+  get size(): { width: number; height: number } {
+    return { width: this.dom.clientWidth, height: this.dom.clientHeight };
+  }
   private rectDiv: HTMLDivElement;
   private rectActive = false;
   private rectStartPx = { x: 0, y: 0 };
   private gridVisible = true;
   private disposables: (() => void)[] = [];
+  private clock = new THREE.Clock();
+  private frameRadius = 3;
 
   constructor(container: HTMLElement) {
     this.dom = container;
@@ -56,13 +71,26 @@ export class Editor {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x1b1d21);
 
-    this.camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.01, 500);
-    this.camera.position.set(2.6, 1.9, 2.6);
+    const aspect = container.clientWidth / Math.max(container.clientHeight, 1);
+    this.perspCamera = new THREE.PerspectiveCamera(50, aspect, 0.01, 500);
+    this.perspCamera.position.set(2.6, 1.9, 2.6);
+    this.orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, 500);
+    this.camera = this.perspCamera;
+
+    // Navigation gizmo BEFORE OrbitControls: its pointerdown listener must be
+    // registered first so clicks inside the gizmo can preempt orbiting.
+    this.navGizmo = new NavigationGizmo(this);
 
     this.orbit = new OrbitControls(this.camera, this.renderer.domElement);
     this.orbit.enableDamping = true;
     this.orbit.dampingFactor = 0.12;
     this.orbit.target.set(0, 0.5, 0);
+    this.orbit.addEventListener('change', () => {
+      // User-driven orbit (not our own snap tween / gizmo drag): let the nav
+      // gizmo auto-restore the projection when leaving an axis view.
+      if (!this.navGizmo?.busy) this.navGizmo?.onUserOrbit();
+      this.navGizmo?.markUser();
+    });
 
     // Lights.
     const hemi = new THREE.HemisphereLight(0xffffff, 0x33383f, 1.15);
@@ -111,7 +139,10 @@ export class Editor {
 
   private animate = (): void => {
     requestAnimationFrame(this.animate);
+    const dt = this.clock.getDelta();
     this.orbit.update();
+    this.navGizmo.update(dt);
+    // The nav gizmo renders itself into its own canvas (own overlay space).
     this.renderer.render(this.scene, this.camera);
   };
 
@@ -119,9 +150,101 @@ export class Editor {
     const w = this.dom.clientWidth;
     const h = this.dom.clientHeight;
     if (w === 0 || h === 0) return;
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+    this.updateCameraAspect(w, h);
     this.renderer.setSize(w, h);
+  }
+
+  private updateCameraAspect(w: number, h: number): void {
+    const aspect = w / Math.max(h, 1);
+    if (this.camera instanceof THREE.PerspectiveCamera) {
+      this.camera.aspect = aspect;
+    } else {
+      // Ortho: keep the vertical world extent, adjust horizontal only.
+      const oc = this.camera as THREE.OrthographicCamera;
+      const halfH = (oc.top - oc.bottom) / 2;
+      oc.top = halfH;
+      oc.bottom = -halfH;
+      oc.left = -halfH * aspect;
+      oc.right = halfH * aspect;
+    }
+    this.camera.updateProjectionMatrix();
+  }
+
+  // ---------- projection ----------
+
+  get isOrtho(): boolean {
+    return this.camera instanceof THREE.OrthographicCamera;
+  }
+
+  /** Blender-style Numpad-5: swap perspective/orthographic, keeping the view. */
+  toggleProjection(): void {
+    const target = this.orbit.target;
+    const dist = Math.max(this.orbit.getDistance(), 0.001);
+    const aspect = this.dom.clientWidth / Math.max(this.dom.clientHeight, 1);
+
+    if (this.camera instanceof THREE.PerspectiveCamera) {
+      const persp = this.camera as THREE.PerspectiveCamera;
+      // Match framing: ortho frustum height ≈ visible height at target distance.
+      const halfH = dist * Math.tan(THREE.MathUtils.degToRad(persp.fov / 2));
+      const oc = this.orthoCamera;
+      oc.position.copy(persp.position);
+      oc.quaternion.copy(persp.quaternion);
+      oc.up.copy(persp.up);
+      oc.top = halfH;
+      oc.bottom = -halfH;
+      oc.left = -halfH * aspect;
+      oc.right = halfH * aspect;
+      oc.near = 0.01;
+      oc.far = Math.max(dist * 40, 500);
+      oc.zoom = 1;
+      oc.updateProjectionMatrix();
+      this.camera = oc;
+    } else {
+      const oc = this.orthoCamera;
+      const persp = this.perspCamera;
+      persp.position.copy(oc.position);
+      persp.quaternion.copy(oc.quaternion);
+      persp.up.copy(oc.up);
+      // Match framing: distance so the visible height equals the ortho frustum.
+      const halfH = (oc.top - oc.bottom) / 2 / Math.max(oc.zoom, 1e-6);
+      const d = halfH / Math.tan(THREE.MathUtils.degToRad(persp.fov / 2));
+      persp.position.copy(target).addScaledVector(new THREE.Vector3(0, 0, 1).applyQuaternion(oc.quaternion), d);
+      persp.near = Math.max(d / 100, 0.001);
+      persp.far = d * 40;
+      persp.updateProjectionMatrix();
+      this.camera = persp;
+    }
+    this.orbit.object = this.camera;
+    this.orbit.update();
+    (this.gizmo as any).camera = this.camera;
+    this.frameRadius = this.computeFrameRadius();
+  }
+
+  /** Zoom in (>1) / out (<1) — Blender-style dolly about the orbit target. */
+  dollyBy(factor: number): void {
+    const target = this.orbit.target;
+    if (this.camera instanceof THREE.PerspectiveCamera) {
+      const cam = this.camera as THREE.PerspectiveCamera;
+      const offset = new THREE.Vector3().subVectors(cam.position, target);
+      const d = THREE.MathUtils.clamp(offset.length() / factor, 0.01, 500);
+      offset.setLength(d);
+      cam.position.copy(target).add(offset);
+    } else {
+      const cam = this.camera as THREE.OrthographicCamera;
+      cam.zoom = THREE.MathUtils.clamp(cam.zoom * factor, 0.02, 200);
+      cam.updateProjectionMatrix();
+    }
+    this.orbit.update();
+    this.frameRadius = this.computeFrameRadius();
+  }
+
+  private computeFrameRadius(): number {
+    const dist = Math.max(this.orbit.getDistance(), 0.001);
+    const cam = this.camera;
+    if (cam instanceof THREE.PerspectiveCamera) {
+      return dist * Math.tan(THREE.MathUtils.degToRad(cam.fov / 2));
+    }
+    return cam.top / Math.max(cam.zoom, 1e-6);
   }
 
   // ---------- model ----------
@@ -139,19 +262,40 @@ export class Editor {
     this.rebuildGrid();
   }
 
+  /** Blender-style view framing: keep model in view after camera swaps/zoom. */
   frameModel(): void {
     const box = new THREE.Box3().setFromObject(this.modelRoot);
     if (box.isEmpty()) return;
     const center = box.getCenter(new THREE.Vector3());
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 0.001);
-    const dist = (maxDim / 2) / Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 1.7;
+    const aspect = this.dom.clientWidth / Math.max(this.dom.clientHeight, 1);
     const dir = new THREE.Vector3(1, 0.65, 1).normalize();
-    this.camera.position.copy(center).addScaledVector(dir, dist);
-    this.camera.near = Math.max(maxDim / 1000, 0.001);
-    this.camera.far = dist * 40;
-    this.camera.updateProjectionMatrix();
+
+    if (this.camera instanceof THREE.PerspectiveCamera) {
+      const dist = (maxDim / 2) / Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 1.7;
+      this.camera.position.copy(center).addScaledVector(dir, dist);
+      this.camera.near = Math.max(dist / 1000, 0.001);
+      this.camera.far = dist * 40;
+      this.camera.updateProjectionMatrix();
+    } else {
+      const oc = this.camera as THREE.OrthographicCamera;
+      const halfH = (maxDim / 2) * 1.7;
+      oc.position.copy(center).addScaledVector(dir, maxDim * 8);
+      oc.near = 0.01;
+      oc.far = maxDim * 40;
+      oc.top = halfH;
+      oc.bottom = -halfH;
+      oc.left = -halfH * aspect;
+      oc.right = halfH * aspect;
+      oc.zoom = 1;
+      oc.updateProjectionMatrix();
+    }
+    this.orbit.object = this.camera;
+    (this.gizmo as any).camera = this.camera;
     this.orbit.target.copy(center);
+    this.orbit.update();
+    this.frameRadius = this.computeFrameRadius();
     this.rebuildGrid();
   }
 
@@ -220,8 +364,7 @@ export class Editor {
 
   raycastModel(ndc: THREE.Vector2): { object: THREE.Mesh; faceIndex: number; point: THREE.Vector3; distance: number } | null {
     this.raycaster.setFromCamera(ndc, this.camera);
-    const hits = this.raycaster.intersectObjects(this.modelRoot.children, true);
-    for (const h of hits) {
+    const hits = this.raycaster.intersectObjects(this.modelRoot.children, true);    for (const h of hits) {
       if (h.faceIndex !== undefined && h.faceIndex !== null && (h.object as THREE.Mesh).isMesh) {
         return { object: h.object as THREE.Mesh, faceIndex: h.faceIndex, point: h.point.clone(), distance: h.distance };
       }
@@ -312,6 +455,7 @@ export class Editor {
 
   detachGizmo(): void {
     this.gizmo.detach();
+    this.gizmo.showX = this.gizmo.showY = this.gizmo.showZ = true; // reset axis locks (floor scale hides Y)
     this.gizmoHelper.visible = false;
   }
 
