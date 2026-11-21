@@ -493,7 +493,7 @@ ok('model subtabs Info/Transform/FFD', modelTabs.join(',') === 'Info,Transform,F
 await page.click('#tool-floor');
 await page.waitForTimeout(200);
 const floorTabs = await page.evaluate(() => [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent));
-ok('floor subtabs Floor/Transform', floorTabs.join(',') === 'Floor,Transform', JSON.stringify(floorTabs));
+ok('floor subtabs Floor/Brush/Transform', floorTabs.join(',') === 'Floor,Brush,Transform', JSON.stringify(floorTabs));
 // the Transform subtab shows the same group layout as the model's panel
 await page.click('#subtabs button:has-text("Transform")');
 await page.waitForTimeout(200);
@@ -781,6 +781,409 @@ await page.evaluate(() => {
 });
 await page.waitForTimeout(400);
 await page.screenshot({ path: `${ROOT}/.smoke/07-after-flatten.png` });
+
+// ---- 4b. Floor ▸ Brush: panel, falloff curves, snapping, live highlight
+await page.click('#tool-floor');
+await page.click('#subtabs button:has-text("Brush")');
+await page.waitForTimeout(500);
+
+const brushPanel = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const groups = [...document.querySelectorAll('#panel-body .gtitle')].map((b) => b.textContent);
+  const canvas = document.getElementById('brush-curve');
+  const selects = [...document.querySelectorAll('#panel-body select')].map((s) => [...s.options].map((o) => o.value));
+  const sliders = document.querySelectorAll('#panel-body input[type=range]').length;
+  const gizmo = window.__FL__.editor.gizmo;
+  return {
+    title: document.getElementById('panel-title').textContent,
+    groups,
+    canvas: canvas ? { w: canvas.width, h: canvas.height } : null,
+    selects,
+    sliders,
+    brushMode: f.brushMode,
+    radius: f.brushSettings.radius,
+    falloff: f.brushSettings.falloffRadius,
+    gizmoObj: gizmo.object ? gizmo.object.name : null,
+    previewCheckbox: !!document.querySelector('#panel-body input[type=checkbox]'),
+  };
+});
+ok('Floor ▸ Brush panel exists with radius/falloff/curve controls',
+  brushPanel.title.includes('Brush') &&
+  brushPanel.groups.includes('Brush') && brushPanel.groups.includes('Live intersection') &&
+  brushPanel.canvas && brushPanel.canvas.w > 0 && brushPanel.canvas.h > 0 &&
+  brushPanel.selects.some((o) => o.join(',') === 'smoothstep,gaussian') &&
+  brushPanel.sliders >= 2 && brushPanel.previewCheckbox,
+  JSON.stringify(brushPanel));
+ok('Brush mode detaches the floor gizmo and auto-sizes the brush',
+  brushPanel.brushMode && brushPanel.gizmoObj === null &&
+  brushPanel.radius > 0 && brushPanel.falloff > 0 && brushPanel.falloff < brushPanel.radius,
+  JSON.stringify({ gizmo: brushPanel.gizmoObj, r: brushPanel.radius, f: brushPanel.falloff }));
+
+// The curve preview must actually render (not just be an empty canvas).
+const curvePixels = await page.evaluate(() => {
+  const c = document.getElementById('brush-curve');
+  if (!c) return 0;
+  const ctx = c.getContext('2d');
+  const d = ctx.getImageData(0, 0, c.width, c.height).data;
+  let lit = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 2] > d[i] + 15) lit++;
+  }
+  return lit;
+});
+ok('brush curve preview is rendered', curvePixels > 100, `lit pixels ${curvePixels}`);
+
+// Both falloff curves: endpoints 1→0, monotonic, core/edge weights.
+const curveMath = await page.evaluate(async () => {
+  const m = await import('/src/brush.ts');
+  const s = { radius: 2, falloffRadius: 0.8, curve: 'smoothstep', hardness: 0.5, strength: 1 };
+  const ts = [0, 0.25, 0.5, 0.75, 1];
+  const smooth = ts.map((t) => m.falloffWeight(t, 'smoothstep', 0.5));
+  const gauss = ts.map((t) => m.falloffWeight(t, 'gaussian', 0.5));
+  const mono = (a) => a.every((v, i) => i === 0 || v <= a[i - 1] + 1e-9);
+  return {
+    smooth, gauss,
+    smoothEnds: Math.abs(smooth[0] - 1) < 1e-9 && Math.abs(smooth[4]) < 1e-9,
+    gaussEnds: Math.abs(gauss[0] - 1) < 1e-9 && Math.abs(gauss[4]) < 1e-9,
+    mono: mono(smooth) && mono(gauss),
+    core: m.brushWeightAt(0.8, s),
+    edge: m.brushWeightAt(2, s),
+    bandMid: m.brushWeightAt(1.4, s),
+  };
+});
+ok('falloff curves: endpoints, monotonic, core/edge weights',
+  curveMath.smoothEnds && curveMath.gaussEnds && curveMath.mono &&
+  Math.abs(curveMath.core - 1) < 1e-9 && curveMath.edge === 0 &&
+  curveMath.bandMid > 0 && curveMath.bandMid < 1,
+  JSON.stringify(curveMath));
+
+// UI controls write through to the settings.
+await page.selectOption('#panel-body select', 'gaussian');
+await page.evaluate(() => {
+  const ranges = [...document.querySelectorAll('#panel-body input[type=range]')];
+  ranges[0].value = '0.9';
+  ranges[0].dispatchEvent(new Event('input', { bubbles: true }));
+  const nums = [...document.querySelectorAll('#panel-body input[type=number]')];
+  nums[0].value = '2.5';
+  nums[0].dispatchEvent(new Event('change', { bubbles: true }));
+});
+await page.waitForTimeout(150);
+const brushControls = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  return {
+    curve: f.brushSettings.curve,
+    hardness: f.brushSettings.hardness,
+    radius: f.brushSettings.radius,
+    falloff: f.brushSettings.falloffRadius,
+  };
+});
+ok('brush controls update settings (curve / hardness / radius)',
+  brushControls.curve === 'gaussian' && Math.abs(brushControls.hardness - 0.9) < 1e-6 &&
+  Math.abs(brushControls.radius - 2.5) < 1e-3,
+  JSON.stringify(brushControls));
+
+// Reducing the radius below the falloff radius clamps the falloff.
+const clampTest = await page.evaluate(() => {
+  const nums = [...document.querySelectorAll('#panel-body input[type=number]')];
+  nums[0].value = '0.5';
+  nums[0].dispatchEvent(new Event('change', { bubbles: true }));
+  const f = window.__FL__.floorTool;
+  return {
+    radius: f.brushSettings.radius,
+    falloff: f.brushSettings.falloffRadius,
+    falloffField: nums[1].value,
+  };
+});
+ok('falloff radius clamps to the brush radius',
+  Math.abs(clampTest.radius - 0.5) < 1e-9 && clampTest.falloff <= clampTest.radius + 1e-9 &&
+  Math.abs(parseFloat(clampTest.falloffField) - clampTest.falloff) < 1e-3,
+  JSON.stringify(clampTest));
+
+// Set up a deterministic brush scenario: horizontal plane through the lower
+// part of the model, hard-core brush so affected vertices snap exactly.
+const brushSetup = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const m = window.__FL__.meshes[0];
+  const THREE = window.__FL__.THREE;
+  const root = f.planeVisuals.plane.parent;
+  root.rotation.set(0, 0, 0);
+  m.geometry.computeBoundingBox();
+  const bb = m.geometry.boundingBox;
+  const size = bb.getSize(new THREE.Vector3());
+  const center = bb.getCenter(new THREE.Vector3());
+  f.settings.sizeX = size.x * 1.25;
+  f.settings.sizeZ = size.z * 1.25;
+  f.settings.cx = center.x;
+  f.settings.cz = center.z;
+  f.settings.y = bb.min.y + size.y * 0.12;
+  f.updatePlane();
+  f.brushSettings.radius = 2.0;
+  f.brushSettings.falloffRadius = 2.0;
+  f.brushSettings.strength = 1;
+  f.brushSettings.curve = 'smoothstep';
+  f.brushSettings.hardness = 0.5;
+  f.scan(); // establish a known highlight baseline (auto-scan is tested below)
+
+  const frame = f.frame();
+  const arr = m.geometry.getAttribute('position').array;
+  const n = frame.normal, p = frame.point;
+  // Prefer a vertex that is both near the plane and near the model centre
+  // (a clean, dense patch for the screenshot); fall back to the closest.
+  let best = -1, bestScore = Infinity, bestS = 0;
+  let fallback = -1, fallbackAbs = Infinity, fallbackS = 0;
+  for (let i = 0; i < arr.length / 3; i++) {
+    const x = arr[i * 3], y = arr[i * 3 + 1], z = arr[i * 3 + 2];
+    const u = frame.xAxis.x * (x - p.x) + frame.xAxis.y * (y - p.y) + frame.xAxis.z * (z - p.z);
+    const w = frame.zAxis.x * (x - p.x) + frame.zAxis.y * (y - p.y) + frame.zAxis.z * (z - p.z);
+    if (u < -frame.halfX || u > frame.halfX || w < -frame.halfZ || w > frame.halfZ) continue;
+    const s = n.x * (x - p.x) + n.y * (y - p.y) + n.z * (z - p.z);
+    const a = Math.abs(s);
+    if (a < fallbackAbs) { fallbackAbs = a; fallback = i; fallbackS = s; }
+    if (a > 1.0) continue;
+    const score = a * 2 + Math.hypot(x - center.x, z - center.z);
+    if (score < bestScore) { bestScore = score; best = i; bestS = s; }
+  }
+  if (best < 0) { best = fallback; bestS = fallbackS; }
+  if (best < 0) return null;
+  const centerPt = new THREE.Vector3(
+    arr[best * 3] - n.x * bestS,
+    arr[best * 3 + 1] - n.y * bestS,
+    arr[best * 3 + 2] - n.z * bestS,
+  );
+  return {
+    center: centerPt.toArray(),
+    vertex: best,
+    signed: bestS,
+    planeY: f.settings.y,
+    bbox: { min: bb.min.toArray(), max: bb.max.toArray() },
+    areas: f.areas.length,
+    crossing: f.crossing.size,
+    onPlane: f.onPlane.size,
+  };
+});
+ok('brush scenario finds a vertex on the plane', !!brushSetup, JSON.stringify(brushSetup));
+// Sync the panel fields with the programmatic setup (real users only change
+// these through the panel, but the screenshot should match the live brush).
+await page.evaluate(() => window.__FL__.buildPanel());
+await page.waitForTimeout(120);
+
+// A single hard dab: only vertices inside the sphere move, and they land on
+// the plane (push down above it / pull up below it).
+const dab = await page.evaluate((centerArr) => {
+  const f = window.__FL__.floorTool;
+  const m = window.__FL__.meshes[0];
+  const THREE = window.__FL__.THREE;
+  const center = new THREE.Vector3(centerArr[0], centerArr[1], centerArr[2]);
+  const frame = f.frame();
+  const arr = m.geometry.getAttribute('position').array;
+  const before = new Float32Array(arr);
+  const res = f.applyBrushAtPoint(center);
+  const n = frame.normal, p = frame.point;
+  const r = f.brushSettings.radius;
+  let outsideMoved = 0, notOnPlane = 0, changed = 0, maxAfter = 0, pushDown = 0, pullUp = 0;
+  for (let i = 0; i < arr.length / 3; i++) {
+    if (arr[i * 3] === before[i * 3] && arr[i * 3 + 1] === before[i * 3 + 1] && arr[i * 3 + 2] === before[i * 3 + 2]) continue;
+    changed++;
+    const dx = before[i * 3] - center.x, dy = before[i * 3 + 1] - center.y, dz = before[i * 3 + 2] - center.z;
+    if (Math.sqrt(dx * dx + dy * dy + dz * dz) > r + 1e-4) outsideMoved++;
+    const sBefore = n.x * (before[i * 3] - p.x) + n.y * (before[i * 3 + 1] - p.y) + n.z * (before[i * 3 + 2] - p.z);
+    const sAfter = n.x * (arr[i * 3] - p.x) + n.y * (arr[i * 3 + 1] - p.y) + n.z * (arr[i * 3 + 2] - p.z);
+    if (sBefore > 0) pushDown++; else if (sBefore < 0) pullUp++;
+    const a = Math.abs(sAfter);
+    if (a > maxAfter) maxAfter = a;
+    if (a > 1e-3) notOnPlane++;
+  }
+  // restore the pre-dab state (this dab is a math check, not a history step)
+  arr.set(before);
+  const pos = m.geometry.getAttribute('position');
+  pos.needsUpdate = true;
+  m.geometry.computeBoundingBox();
+  m.geometry.computeBoundingSphere();
+  return { affected: res.affected, moved: res.moved, changed, outsideMoved, notOnPlane, maxAfter, pushDown, pullUp };
+}, brushSetup.center);
+ok('brush snaps only the nearest vertices inside the radius onto the plane',
+  dab.moved > 0 && dab.changed > 0 && Math.abs(dab.moved - dab.changed) <= 2 &&
+  dab.outsideMoved === 0 && dab.notOnPlane === 0 && dab.maxAfter < 1e-3 &&
+  dab.pushDown + dab.pullUp === dab.changed,
+  JSON.stringify(dab));
+
+// A real stroke: one undo step, live auto-highlight, undo/redo.
+const liveBrush = await page.evaluate((centerArr) => {
+  const f = window.__FL__.floorTool;
+  const m = window.__FL__.meshes[0];
+  const THREE = window.__FL__.THREE;
+  const ed = window.__FL__.editor;
+  const center = new THREE.Vector3(centerArr[0], centerArr[1], centerArr[2]);
+  const dist = 12;
+  ed.orbit.target.copy(center);
+  ed.camera.position.set(center.x + dist * 0.7, center.y + dist * 0.55, center.z + dist * 0.8);
+  ed.camera.lookAt(center);
+  ed.orbit.update();
+  ed.camera.updateMatrixWorld(true);
+  const p = center.clone().project(ed.camera);
+  const ndc = new THREE.Vector2(p.x, p.y);
+  f.updatePointer(ndc);
+  window.__brushBefore = new Float32Array(m.geometry.getAttribute('position').array);
+  window.__brushOnPlaneBefore = f.onPlane.size;
+  f.beginBrushStroke(ndc);
+  f.endBrushStroke(ndc);
+  return {
+    ndc: [ndc.x, ndc.y],
+    onPlaneBefore: window.__brushOnPlaneBefore,
+    last: f.lastBrushResult ? { ...f.lastBrushResult } : null,
+    undoLabel: window.__FL__.history.undoLabel,
+  };
+}, brushSetup.center);
+ok('brush stroke records one undoable step and reports the dab',
+  liveBrush.last && liveBrush.last.totalMoved > 0 &&
+  liveBrush.undoLabel === 'Brush: push/pull to floor',
+  JSON.stringify(liveBrush));
+
+await page.waitForTimeout(400);
+const liveHighlight = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  const overlay = window.__FL__.editor.overlayGroup.children;
+  return {
+    onPlane: f.onPlane.size,
+    before: window.__brushOnPlaneBefore,
+    areas: f.areas.length,
+    crossing: f.crossing.size,
+    segments: f.segments ? f.segments.length / 6 : 0,
+    hitMesh: overlay.some((o) => o.isMesh && o.renderOrder === 4),
+    hitLines: overlay.some((o) => o.isLineSegments && o.renderOrder === 6),
+  };
+});
+ok('brush auto-highlights the snapped patch on the plane',
+  liveHighlight.onPlane > liveHighlight.before && liveHighlight.hitMesh &&
+  liveHighlight.segments > 0,
+  JSON.stringify(liveHighlight));
+
+const undoBrush = await page.evaluate(() => {
+  const m = window.__FL__.meshes[0];
+  const label = window.__FL__.history.undoLabel;
+  window.__FL__.history.undo();
+  const arr = m.geometry.getAttribute('position').array;
+  const before = window.__brushBefore;
+  let maxDiff = 0;
+  for (let i = 0; i < arr.length; i++) maxDiff = Math.max(maxDiff, Math.abs(arr[i] - before[i]));
+  return { label, maxDiff, canRedo: window.__FL__.history.canRedo };
+});
+ok('brush undo restores the pre-stroke vertices',
+  undoBrush.label === 'Brush: push/pull to floor' && undoBrush.maxDiff < 1e-6 && undoBrush.canRedo,
+  JSON.stringify(undoBrush));
+await page.waitForTimeout(300);
+const undoHighlight = await page.evaluate(() => ({ onPlane: window.__FL__.floorTool.onPlane.size }));
+ok('undo auto-refreshes the intersection highlight',
+  undoHighlight.onPlane === liveHighlight.before, JSON.stringify({ undoHighlight, before: liveHighlight.before }));
+
+await page.evaluate(() => window.__FL__.history.redo());
+await page.waitForTimeout(300);
+const redoHighlight = await page.evaluate(() => ({
+  onPlane: window.__FL__.floorTool.onPlane.size,
+  canUndo: window.__FL__.history.canUndo,
+}));
+ok('redo re-applies the brush and the highlight',
+  redoHighlight.onPlane === liveHighlight.onPlane && redoHighlight.canUndo,
+  JSON.stringify(redoHighlight));
+
+// Moving the plane refreshes the highlight with no Scan click.
+const autoMove = await page.evaluate(async () => {
+  const f = window.__FL__.floorTool;
+  const m = window.__FL__.meshes[0];
+  const THREE = window.__FL__.THREE;
+  m.geometry.computeBoundingBox();
+  const bb = m.geometry.boundingBox;
+  const savedY = f.settings.y;
+  f.settings.y = bb.min.y - 2; // below the whole model → nothing intersects
+  f.updatePlane();
+  await new Promise((r) => setTimeout(r, 250));
+  const below = { areas: f.areas.length, crossing: f.crossing.size, onPlane: f.onPlane.size };
+  f.settings.y = bb.min.y + (bb.max.y - bb.min.y) * 0.12;
+  f.updatePlane();
+  await new Promise((r) => setTimeout(r, 250));
+  const inside = { areas: f.areas.length, crossing: f.crossing.size, onPlane: f.onPlane.size };
+  f.settings.y = savedY;
+  f.updatePlane();
+  await new Promise((r) => setTimeout(r, 250));
+  return { below, inside };
+});
+ok('plane moves auto-refresh the intersection highlight (no Scan click)',
+  autoMove.below.areas === 0 && autoMove.below.crossing === 0 &&
+  autoMove.inside.areas > 0 && autoMove.inside.crossing > 0,
+  JSON.stringify(autoMove));
+
+// Cursor rings + affected-vertex preview are live under the pointer.
+await page.evaluate((centerArr) => {
+  const f = window.__FL__.floorTool;
+  const ed = window.__FL__.editor;
+  const THREE = window.__FL__.THREE;
+  const center = new THREE.Vector3(centerArr[0], centerArr[1], centerArr[2]);
+  const dist = 9;
+  ed.orbit.target.copy(center);
+  ed.camera.position.set(center.x + dist * 0.45, center.y + dist * 1.05, center.z + dist * 0.65);
+  ed.camera.lookAt(center);
+  ed.orbit.update();
+  ed.camera.updateMatrixWorld(true);
+  const p = center.clone().project(ed.camera);
+  f.updatePointer(new THREE.Vector2(p.x, p.y));
+}, brushSetup.center);
+await page.waitForTimeout(300);
+const cursorState = await page.evaluate(() => {
+  const f = window.__FL__.floorTool;
+  return {
+    visible: f.brushCursorVisible,
+    previewVisible: f.brushPreviewVisible,
+    previewCount: f.brushPreviewCount,
+    radius: f.brushSettings.radius,
+  };
+});
+ok('brush cursor + affected-vertex preview are live',
+  cursorState.visible && cursorState.previewVisible && cursorState.previewCount > 0,
+  JSON.stringify(cursorState));
+await page.screenshot({ path: `${ROOT}/.smoke/17-floor-brush-panel.png` });
+
+// W in Brush opens the floor Transform panel (gizmo back).
+await page.evaluate(() => document.activeElement && document.activeElement.blur());
+await page.keyboard.press('KeyW');
+await page.waitForTimeout(250);
+const brushKey = await page.evaluate(() => ({
+  activeSub: document.querySelector('#subtabs button.active') ? document.querySelector('#subtabs button.active').textContent : null,
+  brushMode: window.__FL__.floorTool.brushMode,
+  gizmoObj: window.__FL__.editor.gizmo.object ? window.__FL__.editor.gizmo.object.name : null,
+  mode: window.__FL__.floorTool.gizmoMode,
+}));
+ok('W in Brush opens the floor Transform panel with the gizmo',
+  brushKey.activeSub === 'Transform' && !brushKey.brushMode &&
+  brushKey.gizmoObj === 'FloorTransformProxy' && brushKey.mode === 'translate',
+  JSON.stringify(brushKey));
+
+// Back to Brush for a close-up of the live highlight, then leave Floor on its
+// normal sub-tab for the rest of the suite.
+await page.click('#subtabs button:has-text("Brush")');
+await page.waitForTimeout(250);
+await page.evaluate((centerArr) => {
+  const f = window.__FL__.floorTool;
+  const ed = window.__FL__.editor;
+  const THREE = window.__FL__.THREE;
+  const center = new THREE.Vector3(centerArr[0], centerArr[1], centerArr[2]);
+  const dist = 6.5;
+  ed.orbit.target.copy(center);
+  ed.camera.position.set(center.x + dist * 0.5, center.y + dist * 0.8, center.z + dist * 0.85);
+  ed.camera.lookAt(center);
+  ed.orbit.update();
+  ed.camera.updateMatrixWorld(true);
+  const p = center.clone().project(ed.camera);
+  f.updatePointer(new THREE.Vector2(p.x, p.y));
+}, brushSetup.center);
+await page.waitForTimeout(400);
+await page.evaluate(() => {
+  const t = document.getElementById('toast');
+  if (t) t.classList.add('hidden');
+});
+await page.screenshot({ path: `${ROOT}/.smoke/18-brush-highlight.png` });
+await page.click('#subtabs button:has-text("Floor")');
+await page.waitForTimeout(200);
+await page.evaluate(() => window.__FL__.editor.frameModel());
 
 // ---- 5. reference image: create a synthetic png and load it
 const pngData = await page.evaluate(async () => {

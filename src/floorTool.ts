@@ -1,20 +1,22 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
-import type { MeshData, FloorSettings } from './types';
+import type { MeshData, FloorSettings, BrushSettings } from './types';
 import { intersectFloorPlane, dropToPlane, flattenToPlane, type FloorFrame } from './leveling';
-import { selectionFalloff, weldedVertexWeights } from './falloff';
-import { getAdjacency } from './falloff';
+import { selectionFalloff, weldedVertexWeights, getAdjacency } from './falloff';
+import { applyBrushDab, collectBrushHits, type BrushDabResult } from './brush';
 import { makeTextSprite } from './editor';
 import { PendingNodeTransform } from './objectTransform';
 import type { History } from './history';
 
 /**
- * Floor tool (R5–R7): a resizable/movable/rotatable plane; detect mesh faces
- * crossing/below it inside its footprint; highlight connected intersection
- * areas; select one (or several via rect) and level them: rigid "drop" or
- * "flatten" onto the plane, blended with a smooth falloff at the region
- * border. The plane carries a full transform (Translate/Rotate/Scale gizmo) —
- * a tilted plane levels along its own normal.
+ * Floor tool (R5–R7): a resizable/movable/rotatable plane; an AUTOMATIC live
+ * intersection scan that distinguishes buried triangles, triangles accurately
+ * straddling the plane, coplanar (brushed/leveled) triangles and the exact cut
+ * contour; connected areas for rigid "drop" or "flatten" leveling; and the
+ * Brush sub-mode that snaps only the nearest vertices onto the plane (push
+ * down above it, pull up below it) with radius/falloff/curve controls.
+ * The plane carries a full transform (Translate/Rotate/Scale gizmo) — a tilted
+ * plane levels and brushes along its own normal.
  */
 export class FloorTool {
   active = false;
@@ -33,6 +35,33 @@ export class FloorTool {
   lastScanMeshUuid = '';
   /** Auto-fit runs once per model (placement persists across tab switches). */
   private autoFitPending = true;
+
+  // ---------- brush (Floor ▸ Brush) ----------
+
+  brushSettings: BrushSettings = {
+    radius: 0.5,
+    falloffRadius: 0.3,
+    curve: 'smoothstep',
+    hardness: 0.5,
+    strength: 1,
+  };
+  /** True while the Brush sub-panel is active (gizmo detached, LMB paints). */
+  brushMode = false;
+  /** Draw the affected-vertex preview under the cursor. */
+  brushShowPreview = true;
+  /** Report of the latest dab (for the panel's live stats). */
+  lastBrushResult: (BrushDabResult & { totalAffected: number; totalMoved: number }) | null = null;
+  onBrushDab: ((res: BrushDabResult & { totalAffected: number; totalMoved: number }) => void) | null = null;
+
+  /** Latest accurate-intersection details used by the highlight overlay. */
+  crossing: Set<number> = new Set();
+  onPlane: Set<number> = new Set();
+  segments: Float32Array | null = null;
+
+  /** One-time brush-size fit per model. */
+  private brushFitPending = true;
+  /** Signature of the last scan (mesh version + plane matrix) for auto-scan. */
+  private lastScanSig = '';
 
   private editor: Editor;
   private history: History;
@@ -59,6 +88,32 @@ export class FloorTool {
   private hitGeo: THREE.BufferGeometry | null = null;
   private hitColor: THREE.BufferAttribute | null = null;
   private hitSource: THREE.Mesh | null = null;
+  private hitLines: THREE.LineSegments | null = null;
+  private hitLineGeo: THREE.BufferGeometry | null = null;
+
+  // Brush visuals / stroke state.
+  private brushCursor: THREE.Group;
+  private brushOuter: THREE.LineLoop;
+  private brushInner: THREE.LineLoop;
+  private brushDisc: THREE.Mesh;
+  private brushPreview: THREE.Points;
+  private previewGeo: THREE.BufferGeometry;
+  private previewCapacity = 0;
+  private previewIndices = new Int32Array(0);
+  private previewWeights = new Float32Array(0);
+  private readonly previewLow = new THREE.Color(0x3fa9ff);
+  private readonly previewHigh = new THREE.Color(0xffd54a);
+  private readonly previewTmp = new THREE.Color();
+  private pointerNdc: THREE.Vector2 | null = null;
+  private brushDown = false;
+  private forceDab = false;
+  private lastDabNdc = new THREE.Vector2(2, 2);
+  private strokeBefore: Float32Array | null = null;
+  private strokeMeshUuid = '';
+  private strokeAffected = 0;
+  private strokeMoved = 0;
+  private strokeMaxShift = 0;
+  private brushVisualSig = '';
 
   constructor(editor: Editor, history: History, getMesh: () => MeshData | null, onChanged: () => void) {
     this.editor = editor;
@@ -96,6 +151,69 @@ export class FloorTool {
     this.floorLabel.renderOrder = 6;
     this.editor.overlayGroup.add(this.floorLabel);
 
+    // Brush cursor: outer/inner rings + translucent disc, lying on the plane.
+    this.brushCursor = new THREE.Group();
+    this.brushCursor.name = 'BrushCursor';
+    this.brushCursor.visible = false;
+    this.editor.overlayGroup.add(this.brushCursor);
+
+    const ringGeo = (): THREE.BufferGeometry => {
+      const pts: THREE.Vector3[] = [];
+      const segs = 128;
+      for (let i = 0; i < segs; i++) {
+        const a = (i / segs) * Math.PI * 2;
+        pts.push(new THREE.Vector3(Math.cos(a), Math.sin(a), 0));
+      }
+      return new THREE.BufferGeometry().setFromPoints(pts);
+    };
+    this.brushDisc = new THREE.Mesh(
+      new THREE.CircleGeometry(1, 96),
+      new THREE.MeshBasicMaterial({
+        color: 0x4f8cff, transparent: true, opacity: 0.07,
+        depthWrite: false, side: THREE.DoubleSide,
+      }),
+    );
+    this.brushDisc.renderOrder = 18;
+    this.brushDisc.raycast = () => {};
+    this.brushOuter = new THREE.LineLoop(
+      ringGeo(),
+      new THREE.LineBasicMaterial({
+        color: 0xa8dcff, transparent: true, opacity: 0.95,
+        depthTest: false, depthWrite: false,
+      }),
+    );
+    this.brushOuter.renderOrder = 20;
+    this.brushOuter.raycast = () => {};
+    this.brushInner = new THREE.LineLoop(
+      ringGeo(),
+      new THREE.LineBasicMaterial({
+        color: 0x4f8cff, transparent: true, opacity: 0.85,
+        depthTest: false, depthWrite: false,
+      }),
+    );
+    this.brushInner.renderOrder = 21;
+    this.brushInner.raycast = () => {};
+    this.brushCursor.add(this.brushDisc, this.brushOuter, this.brushInner);
+
+    // Affected-vertex preview (screen-space points, drawn over the model).
+    this.previewGeo = new THREE.BufferGeometry();
+    this.brushPreview = new THREE.Points(
+      this.previewGeo,
+      new THREE.PointsMaterial({
+        size: 4.5, sizeAttenuation: false, vertexColors: true,
+        transparent: true, opacity: 0.95, depthTest: false, depthWrite: false,
+      }),
+    );
+    this.brushPreview.frustumCulled = false;
+    this.brushPreview.renderOrder = 22;
+    this.brushPreview.visible = false;
+    this.brushPreview.raycast = () => {};
+    this.brushPreview.name = 'BrushPreview';
+    this.editor.overlayGroup.add(this.brushPreview);
+
+    // Per-frame hook: auto intersection scan + brush painting/cursor.
+    this.editor.addFrameListener(() => this.frameTick());
+
     // Keep `settings` a live mirror of the previewed transform, no matter
     // whether the change came from the gizmo, the Transform sub-panel, or a
     // numeric field. Otherwise a later updatePlane(true) writes stale sizes
@@ -115,11 +233,18 @@ export class FloorTool {
     this.floorRoot.visible = v;
     this.floorLabel.visible = this.planeMesh.visible;
     if (!v) {
+      this.endBrushStroke();
+      this.brushMode = false;
+      this.clearPointer();
       if (was) {
         this.editor.detachGizmo();
         this.clearHitOverlay();
         this.areas = [];
         this.selectedIds.clear();
+        this.crossing.clear();
+        this.onPlane.clear();
+        this.segments = null;
+        this.lastScanSig = '';
       }
     } else {
       // Auto-fit only on the first activation per model — afterwards the
@@ -133,6 +258,9 @@ export class FloorTool {
       // All scale axes stay visible: hiding Y would also hide the XYZ center
       // cube, i.e. the only uniform-scale handle.
       this.editor.gizmo.showY = true;
+      // Entering Floor mode always starts with a fresh, automatic highlight.
+      this.lastScanSig = '';
+      if (this.getMesh()) this.scan();
     }
     this.updatePlane();
     this.onChanged();
@@ -140,7 +268,7 @@ export class FloorTool {
 
   setGizmoMode(mode: 'translate' | 'rotate' | 'scale'): void {
     this.gizmoMode = mode;
-    if (this.active) this.nodeTransform.attachGizmo(mode);
+    if (this.active && !this.brushMode) this.nodeTransform.attachGizmo(mode);
     // Do NOT use showY=false here: TransformControls hides every handle whose
     // name contains a hidden axis (Y, XY, YZ AND XYZ). The floor is flat, so a
     // Y scale is harmless, and the XYZ center cube is needed for uniform
@@ -177,7 +305,7 @@ export class FloorTool {
 
   /** Re-seat the gizmo on the current previewed pivot/orientation. */
   private refreshGizmo(): void {
-    if (this.active) this.nodeTransform.attachGizmo(this.gizmoMode);
+    if (this.active && !this.brushMode) this.nodeTransform.attachGizmo(this.gizmoMode);
   }
 
   /**
@@ -263,6 +391,55 @@ export class FloorTool {
   /** Re-arm the one-time auto-fit (call on model import / mesh switch). */
   armAutoFit(): void {
     this.autoFitPending = true;
+  }
+
+  /** Re-arm the one-time brush-size fit (call on model import / mesh switch). */
+  armBrushFit(): void {
+    this.brushFitPending = true;
+  }
+
+  /**
+   * Size the brush to the model: ~3.5% of its largest dimension, clamped.
+   * Runs once per model when the Brush sub-panel is first opened, so the
+   * default radius is usable on both a 0.5 m scan and a 35 m terrain.
+   */
+  fitBrushToModel(): boolean {
+    const mesh = this.getMesh();
+    if (!mesh) return false;
+    mesh.geometry.computeBoundingBox();
+    const bb = mesh.geometry.boundingBox!;
+    const size = bb.getSize(new THREE.Vector3());
+    const maxDim = Math.max(size.x, size.y, size.z, 0.01);
+    const r = THREE.MathUtils.clamp(maxDim * 0.035, 0.02, 5);
+    this.brushSettings.radius = r;
+    this.brushSettings.falloffRadius = r * 0.6;
+    return true;
+  }
+
+  /**
+   * Enter/leave the Brush sub-panel. In brush mode the floor gizmo is
+   * detached (left-drag paints instead of manipulating the plane) and the
+   * brush cursor appears on the next pointer move.
+   */
+  setBrushMode(v: boolean): void {
+    if (this.brushMode === v) {
+      if (v) {
+        this.brushVisualSig = '';
+        this.nodeTransform.detachGizmo(); // defensive: brush mode never shows the gizmo
+      }
+      return;
+    }
+    this.brushMode = v;
+    if (v) {
+      this.nodeTransform.detachGizmo();
+      if (this.brushFitPending && this.fitBrushToModel()) this.brushFitPending = false;
+      this.brushVisualSig = '';
+    } else {
+      this.endBrushStroke();
+      this.clearPointer();
+      if (this.active) this.nodeTransform.attachGizmo(this.gizmoMode);
+    }
+    this.onChanged();
   }
 
   /**
@@ -368,6 +545,10 @@ export class FloorTool {
     const frame = this.frame();
     const res = intersectFloorPlane(mesh, frame);
     this.lastScanMeshUuid = mesh.object.uuid;
+    this.lastScanSig = this.scanSignature();
+    this.crossing = new Set(res.crossing);
+    this.onPlane = new Set(res.onPlane);
+    this.segments = res.segments.length ? new Float32Array(res.segments) : null;
 
     // Connected components over adjacency within the intersecting set.
     const adj = getAdjacency(mesh);
@@ -407,38 +588,77 @@ export class FloorTool {
     areas.sort((a, b) => b.count - a.count);
     areas.forEach((a, i) => (a.id = i));
     this.areas = areas;
+    // Drop selections whose area id no longer exists after the re-sort.
+    for (const id of [...this.selectedIds]) {
+      if (id < 0 || id >= areas.length) this.selectedIds.delete(id);
+    }
     this.paintHitOverlay(mesh);
     this.onChanged();
     return areas.length;
   }
 
+  /**
+   * Cheap change signature for the auto highlight: mesh + position-buffer
+   * version (bumped by brush/level/FFD/transform/undo) + plane world matrix.
+   * The per-frame tick rescans only when this changes, so the highlight is
+   * always live without scanning when nothing moved.
+   */
+  private scanSignature(): string {
+    const mesh = this.getMesh();
+    if (!mesh) return '';
+    this.floorRoot.updateMatrixWorld(true);
+    const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+    return (
+      mesh.object.uuid + ':' +
+      mesh.geometry.uuid + ':' +
+      (pos ? pos.version : -1) + ':' +
+      this.floorRoot.matrixWorld.elements.join(',')
+    );
+  }
+
+  private autoScanTick(): void {
+    const sig = this.scanSignature();
+    if (!sig || sig === this.lastScanSig) return;
+    this.scan();
+  }
+
+  private frameTick(): void {
+    if (!this.active) return;
+    if (this.brushMode) {
+      if (this.brushDown && this.forceDab) {
+        this.forceDab = false;
+        this.applyBrushAtPointer();
+        if (this.pointerNdc) this.lastDabNdc.copy(this.pointerNdc);
+      }
+      this.updateBrushVisual();
+    }
+    this.autoScanTick();
+  }
+
   private paintHitOverlay(mesh: MeshData): void {
-    // Build a subset geometry containing ONLY the intersecting triangles,
-    // so untouched faces stay clean (no black ghost over the model).
+    // Build a subset geometry containing ONLY the relevant triangles, so
+    // untouched faces stay clean (no black ghost over the model).
     const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
     const src = pos.array as Float32Array;
     const idx = mesh.index;
 
-    // Gather triangles to draw: all scanned areas (color = selected ? red : orange).
-    type Draw = { t: number; sel: boolean };
-    const draw: Draw[] = [];
-    for (const area of this.areas) {
-      const sel = this.selectedIds.has(area.id);
-      for (const t of area.triangles) draw.push({ t, sel });
-    }
-    if (draw.length === 0) {
-      this.clearHitOverlay();
+    let total = this.onPlane.size;
+    for (const area of this.areas) total += area.triangles.length;
+
+    this.clearHitMesh();
+    if (total === 0) {
+      this.clearHitLines();
       return;
     }
 
-    const posArr = new Float32Array(draw.length * 9);
-    const colArr = new Float32Array(draw.length * 9);
-    const cSel = new THREE.Color(0xff5f5f);
-    const cHit = new THREE.Color(0xe0a53f);
-    const c = new THREE.Color();
-    for (let d = 0; d < draw.length; d++) {
-      const { t, sel } = draw[d];
-      c.copy(sel ? cSel : cHit);
+    const posArr = new Float32Array(total * 9);
+    const colArr = new Float32Array(total * 9);
+    const cSel = new THREE.Color(0xff5f5f); // selected area
+    const cCross = new THREE.Color(0xffb347); // accurately crossing the plane
+    const cBelow = new THREE.Color(0x5a4523); // buried below the plane (kept subtle)
+    const cPlane = new THREE.Color(0x35c46f); // flat on the plane (brushed/leveled)
+    let d = 0;
+    const writeTri = (t: number, c: THREE.Color): void => {
       for (let k = 0; k < 3; k++) {
         const vi = idx ? idx[t * 3 + k] : t * 3 + k;
         posArr[d * 9 + k * 3] = src[vi * 3];
@@ -448,16 +668,17 @@ export class FloorTool {
         colArr[d * 9 + k * 3 + 1] = c.g;
         colArr[d * 9 + k * 3 + 2] = c.b;
       }
-    }
+      d++;
+    };
 
-    if (this.hitMesh) {
-      this.editor.overlayGroup.remove(this.hitMesh);
-      (this.hitMesh.material as THREE.Material).dispose();
-      this.hitGeo?.dispose();
-      this.hitMesh = null;
-      this.hitGeo = null;
-      this.hitColor = null;
+    for (const area of this.areas) {
+      const sel = this.selectedIds.has(area.id);
+      for (const t of area.triangles) {
+        writeTri(t, sel ? cSel : this.crossing.has(t) ? cCross : cBelow);
+      }
     }
+    for (const t of this.onPlane) writeTri(t, cPlane);
+
     this.hitGeo = new THREE.BufferGeometry();
     this.hitGeo.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
     this.hitColor = new THREE.BufferAttribute(colArr, 3);
@@ -473,22 +694,311 @@ export class FloorTool {
     this.hitMesh.raycast = () => {};
     this.editor.overlayGroup.add(this.hitMesh);
     this.hitSource = mesh.object;
+
+    this.paintIntersectionLines();
+  }
+
+  /** Crisp exact cut contour (bright yellow) over the crossing band. */
+  private paintIntersectionLines(): void {
+    this.clearHitLines();
+    if (!this.segments || this.segments.length < 6) return;
+    this.hitLineGeo = new THREE.BufferGeometry();
+    this.hitLineGeo.setAttribute('position', new THREE.BufferAttribute(this.segments, 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xffe066, transparent: true, opacity: 0.95,
+      depthWrite: false, polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -4,
+    });
+    this.hitLines = new THREE.LineSegments(this.hitLineGeo, mat);
+    this.hitLines.renderOrder = 6;
+    this.hitLines.frustumCulled = false;
+    this.hitLines.raycast = () => {};
+    this.editor.overlayGroup.add(this.hitLines);
+  }
+
+  private clearHitMesh(): void {
+    if (!this.hitMesh) return;
+    this.editor.overlayGroup.remove(this.hitMesh);
+    (this.hitMesh.material as THREE.Material).dispose();
+    this.hitGeo?.dispose();
+    this.hitMesh = null;
+    this.hitGeo = null;
+    this.hitColor = null;
+    this.hitSource = null;
+  }
+
+  private clearHitLines(): void {
+    if (!this.hitLines) return;
+    this.editor.overlayGroup.remove(this.hitLines);
+    (this.hitLines.material as THREE.Material).dispose();
+    this.hitLineGeo?.dispose();
+    this.hitLines = null;
+    this.hitLineGeo = null;
   }
 
   clearHitOverlay(): void {
-    if (this.hitMesh) {
-      this.editor.overlayGroup.remove(this.hitMesh);
-      (this.hitMesh.material as THREE.Material).dispose();
-      this.hitMesh = null;
-      this.hitGeo = null; // shared attributes — do not dispose
-      this.hitColor = null;
-      this.hitSource = null;
-    }
+    this.clearHitMesh();
+    this.clearHitLines();
+  }
+
+  /** Forget the previous scan (new model / mesh switch / import). */
+  resetScan(): void {
+    this.clearHitOverlay();
+    this.areas = [];
+    this.selectedIds.clear();
+    this.crossing.clear();
+    this.onPlane.clear();
+    this.segments = null;
+    this.lastScanSig = '';
+    this.lastBrushResult = null;
   }
 
   repaint(): void {
     const mesh = this.getMesh();
-    if (mesh && this.hitMesh) this.paintHitOverlay(mesh);
+    if (mesh && (this.hitMesh || this.hitLines)) this.paintHitOverlay(mesh);
+  }
+
+  // ---------- brush (Floor ▸ Brush) ----------
+
+  /** Track the pointer while brush mode is active (cursor + live painting). */
+  updatePointer(ndc: THREE.Vector2): void {
+    const moved = !this.pointerNdc || this.pointerNdc.distanceToSquared(ndc) > 1e-12;
+    this.pointerNdc = ndc.clone();
+    if (moved) {
+      this.brushVisualSig = '';
+      if (this.brushDown) this.forceDab = true;
+    }
+  }
+
+  clearPointer(): void {
+    this.pointerNdc = null;
+    this.hideBrushCursor();
+  }
+
+  get brushStrokeActive(): boolean {
+    return this.brushDown;
+  }
+
+  /** Whether the brush rings are currently shown (tests / UI). */
+  get brushCursorVisible(): boolean {
+    return this.brushCursor.visible;
+  }
+
+  /** Whether the affected-vertex preview is currently shown. */
+  get brushPreviewVisible(): boolean {
+    return this.brushPreview.visible;
+  }
+
+  /** Number of preview points currently drawn. */
+  get brushPreviewCount(): number {
+    const c = this.previewGeo.drawRange.count;
+    return Number.isFinite(c) ? c : 0;
+  }
+
+  /**
+   * Start one undoable brush stroke. The first dab is applied immediately so
+   * a plain click always snaps something; further dabs follow the pointer at
+   * frame rate.
+   */
+  beginBrushStroke(ndc: THREE.Vector2): void {
+    if (!this.active || !this.brushMode) return;
+    const mesh = this.getMesh();
+    if (!mesh) return;
+    const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    this.strokeBefore = new Float32Array(pos.array as Float32Array);
+    this.strokeMeshUuid = mesh.object.uuid;
+    this.strokeAffected = 0;
+    this.strokeMoved = 0;
+    this.strokeMaxShift = 0;
+    this.brushDown = true;
+    this.forceDab = false;
+    this.pointerNdc = ndc.clone();
+    this.lastDabNdc.set(2, 2);
+    this.applyBrushAtPointer();
+    this.lastDabNdc.copy(ndc);
+  }
+
+  /** Finish the stroke and push ONE undo entry for the whole drag. */
+  endBrushStroke(ndc?: THREE.Vector2): void {
+    if (!this.brushDown) return;
+    if (ndc) {
+      this.pointerNdc = ndc.clone();
+      if (ndc.distanceToSquared(this.lastDabNdc) > 1e-12) {
+        this.applyBrushAtPointer();
+        this.lastDabNdc.copy(ndc);
+      }
+    }
+    this.brushDown = false;
+    this.forceDab = false;
+
+    const mesh = this.getMesh();
+    const before = this.strokeBefore;
+    this.strokeBefore = null;
+    if (!mesh || !before || mesh.object.uuid !== this.strokeMeshUuid) {
+      this.strokeMeshUuid = '';
+      return;
+    }
+    const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const after = new Float32Array(pos.array as Float32Array);
+    let changed = false;
+    for (let i = 0; i < after.length; i++) {
+      if (after[i] !== before[i]) {
+        changed = true;
+        break;
+      }
+    }
+    if (changed) {
+      const restore = (src: Float32Array): void => {
+        (pos.array as Float32Array).set(src);
+        pos.needsUpdate = true;
+        mesh.geometry.computeBoundingBox();
+        mesh.geometry.computeBoundingSphere();
+      };
+      this.history.push({
+        name: 'Brush: push/pull to floor',
+        undo: () => restore(before),
+        redo: () => restore(after),
+      });
+      this.onChanged();
+    }
+    this.strokeMeshUuid = '';
+  }
+
+  /**
+   * Apply one dab at an explicit world point on the plane (tests / scripting).
+   * The normal pointer path is begin/update/endBrushStroke.
+   */
+  applyBrushAtPoint(center: THREE.Vector3): BrushDabResult {
+    const mesh = this.getMesh();
+    if (!mesh) return { affected: 0, moved: 0, maxShift: 0 };
+    const res = applyBrushDab(mesh, this.frame(), center, this.brushSettings);
+    this.brushVisualSig = '';
+    return res;
+  }
+
+  /** Where the view ray meets the (possibly tilted) floor plane. */
+  brushCenterFromNdc(ndc: THREE.Vector2): THREE.Vector3 | null {
+    const frame = this.frame();
+    // Make sure the ray uses this frame's camera pose (orbit updates run
+    // before the renderer refreshes matrices).
+    this.editor.camera.updateMatrixWorld();
+    this.editor.ray.setFromCamera(ndc, this.editor.camera);
+    const plane = new THREE.Plane().setFromNormalAndCoplanarPoint(frame.normal, frame.point);
+    const out = new THREE.Vector3();
+    return this.editor.ray.ray.intersectPlane(plane, out) ? out : null;
+  }
+
+  private applyBrushAtPointer(): void {
+    if (!this.pointerNdc) return;
+    const mesh = this.getMesh();
+    if (!mesh) return;
+    const center = this.brushCenterFromNdc(this.pointerNdc);
+    if (!center) return;
+    const res = applyBrushDab(mesh, this.frame(), center, this.brushSettings);
+    this.strokeAffected += res.affected;
+    this.strokeMoved += res.moved;
+    this.strokeMaxShift = Math.max(this.strokeMaxShift, res.maxShift);
+    const report = { ...res, totalAffected: this.strokeAffected, totalMoved: this.strokeMoved };
+    this.lastBrushResult = report;
+    this.brushVisualSig = '';
+    if (this.onBrushDab) this.onBrushDab(report);
+  }
+
+  /**
+   * Position/orient the cursor rings and refresh the affected-vertex preview.
+   * Signature-gated: the expensive per-vertex pass only runs when the
+   * pointer, the brush settings, the plane or the geometry changed.
+   */
+  private updateBrushVisual(): void {
+    if (!this.brushMode || !this.pointerNdc) {
+      this.hideBrushCursor();
+      return;
+    }
+    const mesh = this.getMesh();
+    if (!mesh) {
+      this.hideBrushCursor();
+      return;
+    }
+    this.floorRoot.updateMatrixWorld(true);
+    const s = this.brushSettings;
+    const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const cam = this.editor.camera;
+    cam.updateMatrixWorld();
+    const sig =
+      mesh.object.uuid + ':' + mesh.geometry.uuid + '|' +
+      this.pointerNdc.x.toFixed(5) + ',' + this.pointerNdc.y.toFixed(5) + '|' +
+      s.radius.toFixed(6) + ',' + s.falloffRadius.toFixed(6) + ',' + s.curve + ',' +
+      s.hardness.toFixed(4) + ',' + s.strength.toFixed(4) + '|' +
+      (this.brushShowPreview ? 1 : 0) + '|' + pos.version + '|' +
+      this.floorRoot.matrixWorld.elements.join(',') + '|' +
+      cam.matrixWorld.elements.join(',') + '|' + cam.projectionMatrix.elements.join(',');
+    if (sig === this.brushVisualSig) return;
+    this.brushVisualSig = sig;
+
+    const center = this.brushCenterFromNdc(this.pointerNdc);
+    if (!center) {
+      this.hideBrushCursor();
+      return;
+    }
+    const frame = this.frame();
+    const r = Math.max(1e-4, s.radius);
+    const f = Math.min(Math.max(0, s.falloffRadius), r);
+    this.brushCursor.visible = true;
+    this.brushCursor.position.copy(center);
+    this.brushCursor.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), frame.normal);
+    this.brushDisc.scale.set(r, r, 1);
+    this.brushOuter.scale.set(r, r, 1);
+    this.brushInner.scale.set(f, f, 1);
+    this.updateBrushPreview(mesh, center);
+  }
+
+  private updateBrushPreview(mesh: MeshData, center: THREE.Vector3): void {
+    if (!this.brushShowPreview) {
+      this.brushPreview.visible = false;
+      this.previewGeo.setDrawRange(0, 0);
+      return;
+    }
+    const pos = mesh.geometry.getAttribute('position') as THREE.BufferAttribute;
+    const count = pos.count;
+    if (this.previewCapacity < count) {
+      this.previewCapacity = count;
+      this.previewIndices = new Int32Array(count);
+      this.previewWeights = new Float32Array(count);
+      this.previewGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+      this.previewGeo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(count * 3), 3));
+    }
+    const n = collectBrushHits(mesh, center, this.brushSettings, this.previewIndices, this.previewWeights);
+    if (n === 0) {
+      this.brushPreview.visible = false;
+      this.previewGeo.setDrawRange(0, 0);
+      return;
+    }
+    const posAttr = this.previewGeo.getAttribute('position') as THREE.BufferAttribute;
+    const colAttr = this.previewGeo.getAttribute('color') as THREE.BufferAttribute;
+    const pArr = posAttr.array as Float32Array;
+    const cArr = colAttr.array as Float32Array;
+    const src = pos.array as Float32Array;
+    const tmp = this.previewTmp;
+    for (let i = 0; i < n; i++) {
+      const vi = this.previewIndices[i];
+      pArr[i * 3] = src[vi * 3];
+      pArr[i * 3 + 1] = src[vi * 3 + 1];
+      pArr[i * 3 + 2] = src[vi * 3 + 2];
+      tmp.copy(this.previewLow).lerp(this.previewHigh, Math.min(1, this.previewWeights[i]));
+      cArr[i * 3] = tmp.r;
+      cArr[i * 3 + 1] = tmp.g;
+      cArr[i * 3 + 2] = tmp.b;
+    }
+    posAttr.needsUpdate = true;
+    colAttr.needsUpdate = true;
+    this.previewGeo.setDrawRange(0, n);
+    this.brushPreview.visible = true;
+  }
+
+  private hideBrushCursor(): void {
+    this.brushCursor.visible = false;
+    this.brushPreview.visible = false;
+    this.previewGeo.setDrawRange(0, 0);
+    this.brushVisualSig = '';
   }
 
   /** Area under cursor: raycast triangle → which area contains it. */

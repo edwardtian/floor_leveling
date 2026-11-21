@@ -70,6 +70,27 @@ export interface FloorSettings {
   cz: number;
 }
 
+/** Falloff curve shapes available to the floor brush. */
+export type BrushCurve = 'smoothstep' | 'gaussian';
+
+/**
+ * Floor brush settings: a spherical brush centered where the cursor meets the
+ * floor plane. Vertices inside the sphere are snapped toward the plane (push
+ * down above it, pull up below it) with a smooth falloff.
+ */
+export interface BrushSettings {
+  /** Outer radius of the brush sphere (meters). */
+  radius: number;
+  /** Radius of the full-strength core (meters, 0 … radius). */
+  falloffRadius: number;
+  /** Shape of the falloff band between falloffRadius and radius. */
+  curve: BrushCurve;
+  /** 0 = soft shoulder, 1 = hard edge (shapes the curve). */
+  hardness: number;
+  /** 0 … 1 fraction of the snap distance applied per dab. */
+  strength: number;
+}
+
 export interface RefImageSettings {
   width: number;
   height: number;

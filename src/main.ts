@@ -8,7 +8,8 @@ import { TransformTool } from './transformTool';
 import { FFDTool } from './ffdTool';
 import { FloorTool } from './floorTool';
 import { RefTool } from './refTool';
-import type { MeshData, MeasurementUnits, ToolId } from './types';
+import { brushWeightAt } from './brush';
+import type { MeshData, MeasurementUnits, ToolId, BrushCurve, BrushSettings } from './types';
 import {
   button, checkbox, el, group, hint, modal, numField, selectField, slider,
   toast, unitField, type UnitField,
@@ -35,6 +36,9 @@ const transformTool = new TransformTool(editor, history, () => meshes[activeMesh
 const ffdTool = new FFDTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
 const floorTool = new FloorTool(editor, history, () => meshes[activeMeshIndex] ?? null, refreshAll);
 const refTool = new RefTool(editor, history, refreshAll);
+
+// Live brush stats in the Floor ▸ Brush panel (no-op when it is not mounted).
+floorTool.onBrushDab = () => refreshBrushStats();
 
 editor.addGizmoDragStartListener(() => {
   if (activeModelSub() === 'ffd') ffdTool.beginGizmoDrag();
@@ -116,10 +120,9 @@ async function importFromFile(file: File): Promise<void> {
     transformTool.resetPending();
     transformTool.clearPreview();
     floorTool.resetTransform();
-    floorTool.clearHitOverlay();
-    floorTool.areas = [];
-    floorTool.selectedIds.clear();
+    floorTool.resetScan();
     floorTool.armAutoFit(); // new model → re-arm the one-time auto-fit
+    floorTool.armBrushFit(); // … and the one-time brush-size fit
     const res = await importModel(file);
     meshes = res.meshes;
     activeMeshIndex = 0;
@@ -215,7 +218,7 @@ async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
 type ObjectTab = 'model' | 'floor' | 'ref';
 type ModelSub = 'select' | 'transform' | 'ffd';
 /** Sub-panels inside the Floor / Ref Image tabs. */
-type FloorSub = 'floor' | 'transform';
+type FloorSub = 'floor' | 'brush' | 'transform';
 type RefSub = 'image' | 'transform';
 let floorSub: FloorSub = 'floor';
 let refSub: RefSub = 'image';
@@ -255,6 +258,14 @@ function applyToolState(): void {
   else if (currentTool === 'floor') floorTool.setActive(true);
   else if (currentTool === 'ref') refTool.setActive(true);
 
+  // Floor ▸ Brush owns the left button and detaches the plane gizmo.
+  if (currentTool === 'floor') floorTool.setBrushMode(floorSub === 'brush');
+  // Show the brush cursor immediately when switching to Brush while the
+  // pointer is already over the viewport (no need to jiggle the mouse).
+  if (currentTool === 'floor' && floorSub === 'brush' && pointerInsideCanvas && lastPointerNdc) {
+    floorTool.updatePointer(lastPointerNdc);
+  }
+
   // Left-drag meaning: rect-select/FFD picking need it; orbit for the rest.
   editor.setLeftButtonOrbit(!sub || sub === 'select' || currentTool === 'ref');
   if (sub === 'select') editor.detachGizmo();
@@ -290,6 +301,7 @@ function applyToolState(): void {
     }
   } else if (currentTool === 'floor') {
     addSub('Floor', floorSub === 'floor', () => { floorSub = 'floor'; applyToolState(); });
+    addSub('Brush', floorSub === 'brush', () => { floorSub = 'brush'; applyToolState(); });
     addSub('Transform', floorSub === 'transform', () => { floorSub = 'transform'; applyToolState(); });
   } else {
     addSub('Image', refSub === 'image', () => { refSub = 'image'; applyToolState(); });
@@ -370,7 +382,7 @@ function afterHistoryJump(label: string): void {
   // roughly, so a plain rebase keeps the cage and accepts the new base).
   ffdTool.rebase();
   ffdTool.repaint();
-  if (floorTool.active && floorTool.areas.length) floorTool.scan();
+  if (floorTool.active) floorTool.scan(); // immediate highlight after undo/redo
   transformTool.preview();
   // The floor's settings mirror its node TRS; a history jump can change that
   // TRS (Apply transform undo/redo), so re-sync it before rebuilding fields.
@@ -455,6 +467,13 @@ function handleManipulatorKey(e: KeyboardEvent): void {
   if (!isW && !isE && !isR && !isTab) return;
   e.preventDefault();
 
+  // Floor ▸ Brush has no gizmo; W/E/R/Tab open the plane's Transform panel
+  // (and re-attach its manipulator) instead of silently doing nothing.
+  if (currentTool === 'floor' && floorSub === 'brush') {
+    floorSub = 'transform';
+    applyToolState();
+  }
+
   const ctx = manipulatorCtx();
   if (!ctx) {
     // Info panel: W/E/R/Tab activate the model manipulator.
@@ -501,10 +520,30 @@ window.addEventListener('keydown', (e) => {
 let pointerTracking = false;
 let pointerDownNdc = new THREE.Vector2();
 let additiveDown = false;
+/** Last viewport pointer position, so Brush mode can show its cursor at once. */
+let lastPointerNdc: THREE.Vector2 | null = null;
+let pointerInsideCanvas = false;
+
+editor.renderer.domElement.addEventListener('pointerenter', () => {
+  pointerInsideCanvas = true;
+});
 
 editor.renderer.domElement.addEventListener('pointerdown', (e) => {
   if (e.button !== 0) return;
   if ((editor.gizmo as any).axis) return; // gizmo handles it
+
+  // Floor ▸ Brush: left-drag paints, never rect-selects or orbits.
+  if (currentTool === 'floor' && floorSub === 'brush') {
+    if (!floorTool.active) return;
+    const ndc = editor.ndcFromEvent(e);
+    lastPointerNdc = ndc;
+    pointerInsideCanvas = true;
+    floorTool.updatePointer(ndc);
+    floorTool.beginBrushStroke(ndc);
+    try { editor.renderer.domElement.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+    return;
+  }
+
   if (activeModelSub() !== 'ffd' && currentTool !== 'floor') return;
   pointerTracking = true;
   additiveDown = e.shiftKey;
@@ -513,15 +552,40 @@ editor.renderer.domElement.addEventListener('pointerdown', (e) => {
 });
 
 editor.renderer.domElement.addEventListener('pointermove', (e) => {
+  const ndc = editor.ndcFromEvent(e);
+  lastPointerNdc = ndc;
+  pointerInsideCanvas = true;
+  if (currentTool === 'floor' && floorSub === 'brush') {
+    floorTool.updatePointer(ndc);
+    return;
+  }
   if (pointerTracking) editor.updateRect(e);
 });
 
 editor.renderer.domElement.addEventListener('pointerup', (e) => {
+  if (currentTool === 'floor' && floorSub === 'brush') {
+    floorTool.endBrushStroke(pointerInsideCanvas ? editor.ndcFromEvent(e) : undefined);
+    if (!pointerInsideCanvas) floorTool.clearPointer();
+    return;
+  }
   if (!pointerTracking) return;
   pointerTracking = false;
   const rect = editor.endRect(e);
   if (activeModelSub() === 'ffd') handleFFDPointerUp(rect, e);
   else if (currentTool === 'floor') handleFloorPointerUp(rect, e);
+});
+
+editor.renderer.domElement.addEventListener('pointercancel', () => {
+  if (floorTool.brushStrokeActive) floorTool.endBrushStroke();
+  if (currentTool === 'floor' && floorSub === 'brush') floorTool.clearPointer();
+});
+
+// Hide the brush cursor when the pointer leaves the viewport (not mid-stroke).
+editor.renderer.domElement.addEventListener('pointerleave', () => {
+  pointerInsideCanvas = false;
+  if (currentTool === 'floor' && floorSub === 'brush' && !floorTool.brushStrokeActive) {
+    floorTool.clearPointer();
+  }
 });
 
 function handleFFDPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEvent): void {
@@ -556,7 +620,7 @@ function handleFFDPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEven
 
 function handleFloorPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEvent): void {
   if (floorTool.areas.length === 0) {
-    toast('Press "Scan intersections" to find areas touching the floor plane.');
+    toast('No areas yet — move the plane into the model; the highlight is automatic.');
     return;
   }
   if (rect) {
@@ -601,6 +665,7 @@ function buildPanel(): void {
     else if (sub === 'ffd') buildFFDPanel();
   } else if (currentTool === 'floor') {
     if (floorSub === 'transform') buildNodeTransformPanel('Floor', () => floorTool.gizmoMode, (m) => floorTool.setGizmoMode(m), () => floorTool.hasPendingTransform(), () => floorTool.applyTransform(), () => floorTool.resetTransform());
+    else if (floorSub === 'brush') buildBrushPanel();
     else buildFloorPanel();
   } else if (currentTool === 'ref') {
     if (refSub === 'transform') buildNodeTransformPanel('Image', () => refTool.gizmoMode, (m) => refTool.setGizmoMode(m), () => refTool.hasPendingTransform(), () => refTool.applyTransform(), () => refTool.resetTransform());
@@ -642,7 +707,7 @@ function buildSelectPanel(): void {
   const gh = group('Workflow', panelBody);
   gh.body.appendChild(hint(
     '1 Import → 2 Transform (rotate/apply) → 3 FFD (free-form deform) → 4 Floor plane → ' +
-    '5 Scan intersections → 6 Drop/Flatten → repeat. Ctrl+Z undo.',
+    '5 Auto-highlighted intersections → 6 Brush / Drop / Flatten → repeat. Ctrl+Z undo.',
   ));
 }
 
@@ -654,9 +719,9 @@ function switchActiveMesh(i: number): void {
   }
   activeMeshIndex = i;
   ffdTool.invalidate(); // rest positions captured for another mesh
-  floorTool.areas = [];
-  floorTool.clearHitOverlay();
+  floorTool.resetScan();
   floorTool.armAutoFit();
+  floorTool.armBrushFit();
   editor.frameModel();
   buildPanel();
 }
@@ -922,17 +987,22 @@ function buildFloorPanel(): void {
 
 
   const gscan = group('Intersections', panelBody);
-  const scanBtn = button('Scan intersections', () => {
+  const scanBtn = button('Rescan now', () => {
     const n = floorTool.scan();
     toast(n ? `${n} intersecting area(s) found — click one to select.` : 'No intersections. Move the plane into the model.', n ? 'ok' : 'info');
-    refreshFloorAreas();
-  }, 'btn primary');
+    refreshFloorAreas(true);
+  });
   scanBtn.style.width = '100%';
   gscan.body.appendChild(scanBtn);
+  gscan.body.appendChild(hint(
+    'The highlight is live: it updates automatically while the plane moves or you paint in Brush. ' +
+    'Bright orange = triangles accurately crossing the plane · yellow line = exact cut contour · ' +
+    'green = flat on the plane · dim = buried below.',
+  ));
   const list = el('div');
   list.id = 'floor-areas';
   gscan.body.appendChild(list);
-  refreshFloorAreas();
+  refreshFloorAreas(true);
 
   const gl = group('Level selection', panelBody);
   const rowL = el('div', 'row');
@@ -946,6 +1016,190 @@ function buildFloorPanel(): void {
   ));
 }
 
+/**
+ * Floor ▸ Brush: radius / falloff radius / curve controls with a live curve
+ * preview. Painting happens in the viewport (left-drag) — the brush is a
+ * sphere centered where the cursor meets the floor plane.
+ */
+function buildBrushPanel(): void {
+  panelTitle.textContent = 'Floor — Brush';
+  if (!meshes.length) {
+    panelBody.appendChild(hint('Import a model first.'));
+    return;
+  }
+  const s = floorTool.brushSettings;
+
+  const g = group('Brush', panelBody);
+
+  const canvas = document.createElement('canvas');
+  canvas.id = 'brush-curve';
+  const curveWrap = el('div', 'brush-curve');
+  curveWrap.appendChild(canvas);
+  const refreshCurve = (): void => drawBrushCurve(canvas, s);
+
+  let fFalloff: UnitField | null = null;
+  const fRadius = unitField('Brush radius', s.radius, () => units, (v) => {
+    s.radius = Math.max(0.01, v);
+    if (s.falloffRadius > s.radius) s.falloffRadius = s.radius;
+    fFalloff?.set(s.falloffRadius);
+    refreshCurve();
+  }, { min: 0.01, step: 0.1 });
+  fFalloff = unitField('Falloff radius', s.falloffRadius, () => units, (v) => {
+    s.falloffRadius = THREE.MathUtils.clamp(v, 0, s.radius);
+    fFalloff?.set(s.falloffRadius);
+    refreshCurve();
+  }, { min: 0, step: 0.1 });
+  unitRefreshers.push(fRadius.refresh, fFalloff.refresh);
+  g.body.append(fRadius.root, fFalloff.root);
+  g.body.appendChild(hint('Full strength inside Falloff radius, easing to zero at Brush radius.'));
+
+  const curveField = selectField('Falloff curve', [
+    { value: 'smoothstep', label: 'Smooth Step' },
+    { value: 'gaussian', label: 'Gaussian' },
+  ], s.curve, (v) => {
+    s.curve = v as BrushCurve;
+    refreshCurve();
+  });
+  curveField.select.style.width = '132px';
+  g.body.appendChild(curveField.root);
+
+  g.body.appendChild(slider('Curve hardness', s.hardness, 0, 1, 0.01, (v) => {
+    s.hardness = v;
+    refreshCurve();
+  }));
+  g.body.appendChild(slider('Strength', s.strength, 0.05, 1, 0.01, (v) => {
+    s.strength = v;
+    refreshCurve();
+  }));
+
+  g.body.appendChild(checkbox('Show affected vertices', floorTool.brushShowPreview, (v) => {
+    floorTool.brushShowPreview = v;
+  }));
+
+  g.body.appendChild(curveWrap);
+  refreshCurve();
+  const stats = hint('');
+  stats.id = 'brush-stats';
+  g.body.appendChild(stats);
+  refreshBrushStats();
+
+  g.body.appendChild(hint(
+    'Left-drag on the model to paint. The brush is a sphere centered where the cursor meets the floor plane: ' +
+    'vertices above the plane are pushed down, vertices below are pulled up, and only the nearest vertices ' +
+    'inside the radius move. Right-drag pans; drag the nav gizmo to orbit.',
+  ));
+
+  const gl = group('Live intersection', panelBody);
+  gl.body.appendChild(hint(
+    'The intersection highlight updates automatically while you paint or move the plane: ' +
+    'bright orange = crossing the plane, yellow line = exact cut contour, green = flat on the plane, ' +
+    'dim = buried below. A whole left-drag is one undo step.',
+  ));
+  const row = el('div', 'row');
+  row.appendChild(button('Rescan now', () => { floorTool.scan(); refreshBrushStats(); }));
+  gl.body.appendChild(row);
+}
+
+/** Plot weight(distance/radius) for the current brush settings. */
+function drawBrushCurve(canvas: HTMLCanvasElement, s: BrushSettings): void {
+  // Fits the group body inside the 275 px panel without flex-shrinking the
+  // bitmap (which would squash the grid).
+  const cssW = 192;
+  const cssH = 86;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.style.width = `${cssW}px`;
+  canvas.style.height = `${cssH}px`;
+  const w = Math.round(cssW * dpr);
+  const h = Math.round(cssH * dpr);
+  if (canvas.width !== w || canvas.height !== h) {
+    canvas.width = w;
+    canvas.height = h;
+  }
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = '#1b1d21';
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  const padL = 10;
+  const padR = 9;
+  const padT = 12;
+  const padB = 16;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+
+  // Full-strength core (inside Falloff radius) as a subtle block.
+  const coreRatio = s.radius > 1e-9 ? THREE.MathUtils.clamp(s.falloffRadius / s.radius, 0, 1) : 0;
+  if (coreRatio > 0) {
+    ctx.fillStyle = 'rgba(79,140,255,0.10)';
+    ctx.fillRect(padL, padT, plotW * coreRatio, plotH);
+  }
+
+  ctx.strokeStyle = '#2c3138';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const y = padT + (plotH * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    const x = padL + (plotW * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+  }
+
+  // Falloff radius marker (start of the transition band).
+  const coreX = padL + plotW * coreRatio;
+  ctx.strokeStyle = '#4f8cff';
+  ctx.setLineDash([3, 3]);
+  ctx.beginPath();
+  ctx.moveTo(coreX, padT);
+  ctx.lineTo(coreX, padT + plotH);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  const radius = Math.max(1e-6, s.radius);
+  ctx.beginPath();
+  for (let i = 0; i <= 120; i++) {
+    const t = i / 120;
+    const weight = brushWeightAt(t * radius, s);
+    const x = padL + plotW * t;
+    const y = padT + plotH * (1 - weight);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.strokeStyle = '#9fd8ff';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.lineTo(padL + plotW, padT + plotH);
+  ctx.lineTo(padL, padT + plotH);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(79,140,255,0.16)';
+  ctx.fill();
+
+  ctx.fillStyle = '#9aa0a8';
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.fillText('0', padL, cssH - 3);
+  ctx.fillText('R', padL + plotW - 6, cssH - 3);
+  ctx.fillText('1', 1, padT + 4);
+}
+
+function refreshBrushStats(): void {
+  const el = document.getElementById('brush-stats');
+  if (!el) return;
+  const r = floorTool.lastBrushResult;
+  if (!r) {
+    el.textContent = 'No stroke yet — left-drag on the model to snap vertices.';
+    return;
+  }
+  el.textContent =
+    `Last dab: ${r.affected} affected · ${r.moved} snapped · max Δ ${fmtLen(r.maxShift, units)}` +
+    ` · stroke moves: ${r.totalMoved}`;
+}
+
 let floorFieldAppliers: (() => void)[] = [];
 
 /** Re-read pending→settings into the floor panel fields (after gizmo drag). */
@@ -953,13 +1207,27 @@ function refreshFloorTransformFields(): void {
   for (const fn of floorFieldAppliers) fn();
 }
 
-function refreshFloorAreas(): void {
+let lastAreaListSig = '';
+
+/**
+ * Rebuild the intersection badge list. Signature-gated: the auto scan calls
+ * this every frame while the plane/paint changes, but the DOM only changes
+ * when the area counts or the selection actually change.
+ */
+function refreshFloorAreas(force = false): void {
   const list = document.getElementById('floor-areas');
-  if (!list) return;
-  list.innerHTML = '';
+  if (!list) {
+    lastAreaListSig = '';
+    return;
+  }
   const areas = floorTool.areaSummaries();
+  const selIds = [...floorTool.selectedAreas].sort((a, b) => a - b);
+  const sig = areas.map((a) => `${a.id}:${a.count}`).join('|') + '#' + selIds.join(',');
+  if (!force && sig === lastAreaListSig) return;
+  lastAreaListSig = sig;
+  list.innerHTML = '';
   if (!areas.length) {
-    list.appendChild(hint('No areas yet — press Scan.'));
+    list.appendChild(hint('No intersections yet — move the plane into the model; the highlight is automatic.'));
     return;
   }
   const wrap = el('div', 'row');
@@ -970,7 +1238,7 @@ function refreshFloorAreas(): void {
     b.title = `y ${fmtLen(a.minY, units)} … ${fmtLen(a.maxY, units)}`;
     b.addEventListener('click', () => {
       floorTool.toggleArea(a.id, false);
-      refreshFloorAreas();
+      refreshFloorAreas(true);
     });
     wrap.appendChild(b);
   }
@@ -981,10 +1249,10 @@ function levelAndReport(mode: 'drop' | 'flatten'): void {
   const ok = floorTool.level(mode);
   if (ok) {
     toast(mode === 'drop' ? 'Dropped selection onto the floor plane.' : 'Flattened selection to the floor plane.', 'ok');
-    refreshFloorAreas();
+    refreshFloorAreas(true);
     refreshAll();
   } else {
-    toast('Select an area first (Scan, then click a highlighted region).');
+    toast('Select an area first (click a highlighted region).');
   }
 }
 
@@ -1038,6 +1306,7 @@ function refreshAll(): void {
   syncTopbarChecks();
   (document.getElementById('btn-undo') as HTMLButtonElement).disabled = !history.canUndo;
   (document.getElementById('btn-redo') as HTMLButtonElement).disabled = !history.canRedo;
+  refreshFloorAreas(); // no-op unless the Floor panel's badge list is mounted
   const parts: string[] = [];
   if (importedFileName) {
     parts.push(importedFileName);
@@ -1075,6 +1344,7 @@ import * as THREE_NS from 'three';
   floorTool,
   refTool,
   setTool,
+  buildPanel,
   THREE: THREE_NS,
 };
 // Property-style accessors for the test harness.

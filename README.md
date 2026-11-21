@@ -16,7 +16,7 @@ Other scripts:
 
 ```bash
 pnpm build          # typecheck + production build (dist/)
-node scripts/smoke.mjs   # headless end-to-end test (103 checks, system Chrome)
+node scripts/smoke.mjs   # headless end-to-end test (119 checks, system Chrome)
 ```
 
 ## Workflow
@@ -28,8 +28,54 @@ The toolbar on the left walks through the requirements:
 | **Info** | Orbit (LMB), pan (RMB), zoom (wheel). Model info, mesh picker, **unit switch (m / cm)** — the grid ruler labels follow. |
 | **Transform** | Rotate/translate/scale the whole object with the gizmo or numeric fields. Nothing touches the mesh until **Apply transform** bakes it into the vertex data (like Blender's *Apply Transform*). Planar scale handles (XY/YZ/XZ) use one shared ratio for both axes. |
 | **FFD** | A 3D lattice wraps the model. Click control points (Shift = add, drag = rect-select) and move/rotate/scale them with the gizmo to deform the surface smoothly. **Collapse** bakes the current cage into the mesh, so the next lattice wraps the collapsed shape. |
-| **Floor** | Create a floor plane you can **move / rotate / scale directly in the viewport** (Translate/Rotate/Scale gizmo, T/R/S buttons in the panel) or via numeric fields (width/depth/height/center, spin/tilt, "Fit to model", "Floor @ bottom"). The plane may be tilted — leveling works along the plane's own normal. **Scan intersections** finds and highlights every area of the mesh crossing/below the plane inside its footprint (connected areas, numbered). Select one (click / Shift-click / rect) and level it: **Drop** = rigid translate along the plane normal until the lowest point touches it; **Flatten** = vertices below the plane are pulled onto it. Both blend with a smooth falloff band and clamp band vertices so nothing stays underground. Repeat steps 2–7 as often as you like — every operation is undoable (Ctrl+Z / Ctrl+Shift+Z). |
+| **Floor** | Create a floor plane you can **move / rotate / scale directly in the viewport** (Translate/Rotate/Scale gizmo, T/R/S buttons in the panel) or via numeric fields (width/depth/height/center, spin/tilt, "Fit to model", "Floor @ bottom"). The plane may be tilted — leveling works along the plane's own normal. The **intersection highlight is automatic and live**: moving the plane, painting and undo/redo refresh it, and returning to Floor after model edits rescans immediately. Bright orange = triangles accurately crossing the plane, yellow line = exact cut contour, green = flat on the plane, dim = buried below. The **Brush** sub-panel snaps only the nearest vertices onto the plane (push down above it, pull up below it) with adjustable radius, falloff radius and curve. The Floor sub-panel also lists connected areas (numbered, click / Shift-click / rect-select) for **Drop** (rigid translate until the lowest point touches the plane) or **Flatten** (pull vertices below onto it), both blended with a smooth falloff. Repeat as often as you like — every operation, including a whole brush stroke, is undoable (Ctrl+Z / Ctrl+Shift+Z). |
 | **Ref Image** | Load an image as a guide plane (horizontal/vertical, opacity slider, translate/rotate/scale via gizmo or fields). Purely a visual guide. |
+
+## Floor brush
+
+The **Floor ▸ Brush** sub-panel is a local snap brush for fixing the last few
+centimetres of a scan by hand:
+
+- **Brush radius** — the outer radius of the spherical brush. Only vertices
+  inside this sphere move ("only the nearest vertices"); distant geometry is
+  untouched.
+- **Falloff radius** — the full-strength core. Between it and the brush radius
+  the weight eases to zero.
+- **Falloff curve** — *Smooth Step* or *Gaussian*, with a **curve hardness**
+  slider (soft shoulder ⇄ hard edge) and a live plot of the exact weight curve.
+- **Strength** — fraction of the snap distance applied per dab (1 = exactly
+  onto the plane).
+- **Push / pull** is decided per vertex: vertices above the plane are pushed
+  down, vertices below are pulled up. A whole left-drag is one undo step.
+- The cursor shows the outer ring, the falloff ring and a coloured preview of
+  the affected vertices (blue = weak, yellow = full strength).
+
+The brush is centred where the cursor ray meets the (possibly tilted) floor
+plane; the snap direction is the plane normal. Right-drag pans, and dragging
+the nav gizmo orbits — left-drag is reserved for painting.
+
+![brush panel](.smoke/17-floor-brush-panel.png)
+
+![brush highlight](.smoke/18-brush-highlight.png)
+
+## Live intersection highlight
+
+The intersection highlight is automatic (the Floor panel keeps a **Rescan now**
+button for convenience): a cheap signature (mesh position-buffer version +
+plane world matrix) is checked once per frame, and the scan re-runs only when
+something actually changed. The overlay now distinguishes what the old scan
+lumped together:
+
+| Colour | Meaning |
+| --- | --- |
+| bright orange | triangles that **accurately straddle** the plane (one vertex above, one below) |
+| yellow line | the **exact triangle/plane cut contour** |
+| green | triangles lying flat **on** the plane (a brushed/leveled patch) |
+| dim brown | triangles buried fully below the plane (still selectable for Drop/Flatten) |
+| red | the currently selected area |
+
+This makes brush feedback immediate: snapping a patch turns it green, shrinks
+the orange crossing band and redraws the yellow contour while you paint.
 
 ## Navigation gizmo
 
@@ -56,7 +102,7 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
 | `R` | **Scale** the active object |
 | `Tab` | Cycle the active object's Move → Rotate → Scale |
 
-"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Info (Select) tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` toggles ortho, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
+"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Info (Select) tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. In **Floor ▸ Brush**, left-drag paints, so `W`/`E`/`R`/`Tab` first leave Brush and open the floor plane's Transform panel with its gizmo. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` toggles ortho, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
 
 ## Export
 
@@ -73,7 +119,19 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
   weights, and connected-area detection all operate on welded (quantized 1e-5 m)
   vertices, so edits never crack duplicated-vertex meshes.
 - **Falloff**: BFS hop distance from the selection border over triangle
-  adjacency, smoothstepped over a band proportional to the region size.
+  adjacency, smoothstepped over a band proportional to the region size. The
+  brush uses its own distance falloff (spherical, in metres) with Smooth Step or
+  normalized Gaussian shapes; a brushed patch is welded back together because
+  all coincident vertices inside the sphere receive the same weight.
+- **Live scan**: `intersectFloorPlane` returns the buried/crossing triangle set,
+  the exact straddling subset, coplanar triangles and the triangle/plane cut
+  segments. The tool checks a signature of the position-buffer version and the
+  plane's world matrix once per frame and rescans only on change — so brush
+  dabs, plane drags, FFD/transform edits and undo/redo all update the overlay
+  without a manual Scan click.
+- **Brush stroke undo**: one `Float32Array` snapshot at pointer-down and one at
+  pointer-up, pushed as a single history command (same snapshot strategy as
+  Drop/Flatten).
 - **Undo/redo**: full vertex-buffer snapshots per command (fast for these mesh sizes).
 - **Scene space** is meters; the unit selector is display-only (R7/Q6).
 
@@ -82,18 +140,19 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
 ```
 src/
   main.ts          UI wiring, pointer/rect selection, tool panels
-  editor.ts        renderer, cameras (persp/ortho), grid ruler, gizmo, picking, HUD
+  editor.ts        renderer, cameras (persp/ortho), grid ruler, gizmo, picking, HUD, per-frame hooks
   navGizmo.ts      Blender-style nav gizmo in its own overlay canvas (view balls, orbit drag, zoom, proj toggle)
   importer.ts      glb/gltf/fbx/obj → flat group, import transform baked
   exporter.ts      glb/obj export + optional normalization
   transformTool.ts whole-object pending transform + apply (R2)
   ffdTool.ts       lattice lifecycle, control-point selection, gizmo deform
   ffd.ts           Bernstein–Bézier lattice math
-  floorTool.ts     floor plane, intersection scan, drop/flatten (R5–R7)
+  floorTool.ts     floor plane, live intersection scan, brush mode, drop/flatten (R5–R7)
+  brush.ts         brush falloff curves, dab application, affected-vertex collection
   refTool.ts       reference image plane (R3)
   falloff.ts       welded adjacency, selection falloff, vertex weights
-  leveling.ts      plane intersection, drop/flatten math
+  leveling.ts      plane intersection (crossing/on-plane/cut segments), drop/flatten math
   history.ts       undo/redo stack
   ui.ts            DOM helpers, toasts, modals
-scripts/smoke.mjs  headless end-to-end test (103 checks)
+scripts/smoke.mjs  headless end-to-end test (119 checks)
 ```

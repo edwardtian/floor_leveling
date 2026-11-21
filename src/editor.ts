@@ -31,6 +31,7 @@ export class Editor {
 
   private gizmoDragStartListeners: (() => void)[] = [];
   private gizmoDragEndListeners: (() => void)[] = [];
+  private frameListeners: (() => void)[] = [];
 
   /** Subscribe to gizmo drag start/end (multiple tools can listen). */
   addGizmoDragStartListener(fn: () => void): void {
@@ -39,6 +40,14 @@ export class Editor {
 
   addGizmoDragEndListener(fn: () => void): void {
     this.gizmoDragEndListeners.push(fn);
+  }
+
+  /**
+   * Per-frame callback (runs right before the render). Tools use it for
+   * real-time overlays — e.g. the floor's auto intersection scan.
+   */
+  addFrameListener(fn: () => void): void {
+    this.frameListeners.push(fn);
   }
 
   units: MeasurementUnits = 'meter';
@@ -142,6 +151,7 @@ export class Editor {
     const dt = this.clock.getDelta();
     this.orbit.update();
     this.navGizmo.update(dt);
+    for (const fn of this.frameListeners) fn();
     // The nav gizmo renders itself into its own canvas (own overlay space).
     this.renderer.render(this.scene, this.camera);
   };
