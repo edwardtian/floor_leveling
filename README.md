@@ -16,7 +16,7 @@ Other scripts:
 
 ```bash
 pnpm build          # typecheck + production build (dist/)
-node scripts/smoke.mjs   # headless end-to-end test (119 checks, system Chrome)
+node scripts/smoke.mjs   # headless end-to-end test (123 checks, system Chrome)
 ```
 
 ## Workflow
@@ -154,5 +154,5 @@ src/
   leveling.ts      plane intersection (crossing/on-plane/cut segments), drop/flatten math
   history.ts       undo/redo stack
   ui.ts            DOM helpers, toasts, modals
-scripts/smoke.mjs  headless end-to-end test (119 checks)
+scripts/smoke.mjs  headless end-to-end test (123 checks)
 ```

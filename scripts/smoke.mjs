@@ -833,6 +833,39 @@ const curvePixels = await page.evaluate(() => {
 });
 ok('brush curve preview is rendered', curvePixels > 100, `lit pixels ${curvePixels}`);
 
+// Regression: left-drag in Brush must paint, never orbit the viewport.
+const brushOrbitState = await page.evaluate(() => ({
+  left: window.__FL__.editor.orbit.mouseButtons.LEFT,
+  brushMode: window.__FL__.floorTool.brushMode,
+}));
+ok('Brush mode disables left-drag orbit',
+  brushOrbitState.brushMode && brushOrbitState.left === null,
+  JSON.stringify(brushOrbitState));
+
+const camDir = () => page.evaluate(() => {
+  const d = new window.__FL__.THREE.Vector3();
+  window.__FL__.editor.camera.getWorldDirection(d);
+  return d.toArray();
+});
+await page.evaluate(() => { window.__FL__.editor.orbit.enableDamping = false; });
+const camBefore = await camDir();
+await page.mouse.move(250, 800);
+await page.mouse.down();
+await page.mouse.move(380, 810, { steps: 8 });
+await page.mouse.up();
+await page.waitForTimeout(250);
+const camAfter = await camDir();
+await page.evaluate(() => { window.__FL__.editor.orbit.enableDamping = true; });
+const camDot = camBefore[0] * camAfter[0] + camBefore[1] * camAfter[1] + camBefore[2] * camAfter[2];
+ok('left-drag in Brush does not rotate the viewport', camDot > 0.9999, `dot ${camDot.toFixed(6)}`);
+// The drag may have painted a tiny stroke at the corner; undo it so later
+// checks start from the same geometry.
+const dragUndoLabel = await page.evaluate(() => window.__FL__.history.undoLabel);
+if (dragUndoLabel === 'Brush: push/pull to floor') {
+  await page.evaluate(() => window.__FL__.history.undo());
+  await page.waitForTimeout(150);
+}
+
 // Both falloff curves: endpoints 1→0, monotonic, core/edge weights.
 const curveMath = await page.evaluate(async () => {
   const m = await import('/src/brush.ts');
@@ -1183,7 +1216,23 @@ await page.evaluate(() => {
 await page.screenshot({ path: `${ROOT}/.smoke/18-brush-highlight.png` });
 await page.click('#subtabs button:has-text("Floor")');
 await page.waitForTimeout(200);
+const floorLeftOrbit = await page.evaluate(() => window.__FL__.editor.orbit.mouseButtons.LEFT);
+ok('Floor mode also disables left-drag orbit', floorLeftOrbit === null, JSON.stringify({ left: floorLeftOrbit }));
 await page.evaluate(() => window.__FL__.editor.frameModel());
+
+// Orbit is still the left-drag default in Info (Select) mode.
+const orbitModeCheck = await page.evaluate(() => {
+  const read = () => window.__FL__.editor.orbit.mouseButtons.LEFT;
+  const rotate = window.__FL__.THREE.MOUSE.ROTATE;
+  window.__FL__.setTool('select');
+  const info = read();
+  window.__FL__.setTool('floor');
+  const floor = read();
+  return { info, floor, rotate };
+});
+ok('Info keeps left-drag orbit, Floor keeps it off',
+  orbitModeCheck.info === orbitModeCheck.rotate && orbitModeCheck.floor === null,
+  JSON.stringify(orbitModeCheck));
 
 // ---- 5. reference image: create a synthetic png and load it
 const pngData = await page.evaluate(async () => {

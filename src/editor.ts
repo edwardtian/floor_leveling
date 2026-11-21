@@ -473,7 +473,12 @@ export class Editor {
     return this.gizmoDragging;
   }
 
-  /** While segment/floor tools are active, left-drag is rect-select, so orbit moves to the right button. */
+  /**
+   * Left-drag is orbit only in the Info (Select) and Ref Image modes. Floor
+   * mode uses left-drag for rect-select and Brush mode uses it for painting,
+   * so OrbitControls' left button is disabled there. Right-drag still pans;
+   * orbiting is available through the nav gizmo.
+   */
   setLeftButtonOrbit(v: boolean): void {
     this.orbit.mouseButtons = {
       LEFT: v ? THREE.MOUSE.ROTATE : null,

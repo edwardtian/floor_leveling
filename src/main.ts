@@ -266,8 +266,10 @@ function applyToolState(): void {
     floorTool.updatePointer(lastPointerNdc);
   }
 
-  // Left-drag meaning: rect-select/FFD picking need it; orbit for the rest.
-  editor.setLeftButtonOrbit(!sub || sub === 'select' || currentTool === 'ref');
+  // Left-drag meaning: orbit only in Info (Select) and the Ref Image tab.
+  // Floor uses rect-select in Floor mode and painting in Brush mode;
+  // Transform/FFD use the gizmo/picking.
+  editor.setLeftButtonOrbit(sub === 'select' || currentTool === 'ref');
   if (sub === 'select') editor.detachGizmo();
   if (!sub && currentTool !== 'floor' && currentTool !== 'ref') editor.detachGizmo();
 
