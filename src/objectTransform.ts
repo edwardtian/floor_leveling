@@ -1,6 +1,6 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
-import { DEFAULT_TRANSFORM, TransformValues, transformChanged } from './transform';
+import { DEFAULT_TRANSFORM, TransformValues, planarScaleRatios, transformChanged } from './transform';
 import type { History } from './history';
 
 /**
@@ -191,9 +191,10 @@ export class PendingNodeTransform {
       const rx = start.s.x !== 0 ? this.proxy.scale.x / start.s.x : 1;
       const ry = start.s.y !== 0 ? this.proxy.scale.y / start.s.y : 1;
       const rz = start.s.z !== 0 ? this.proxy.scale.z / start.s.z : 1;
-      this.pending.sx = start.pending.sx * rx;
-      this.pending.sy = start.pending.sy * ry;
-      this.pending.sz = start.pending.sz * rz;
+      const r = planarScaleRatios(this.editor.gizmo.axis, rx, ry, rz);
+      this.pending.sx = start.pending.sx * r.x;
+      this.pending.sy = start.pending.sy * r.y;
+      this.pending.sz = start.pending.sz * r.z;
     }
     this.preview();
     this.onChanged();

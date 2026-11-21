@@ -16,7 +16,7 @@ Other scripts:
 
 ```bash
 pnpm build          # typecheck + production build (dist/)
-node scripts/smoke.mjs   # headless end-to-end test (99 checks, system Chrome)
+node scripts/smoke.mjs   # headless end-to-end test (103 checks, system Chrome)
 ```
 
 ## Workflow
@@ -25,9 +25,9 @@ The toolbar on the left walks through the requirements:
 
 | Tool | What it does |
 |------|--------------|
-| **Select** | Orbit (LMB), pan (RMB), zoom (wheel). Model info, mesh picker, **unit switch (m / cm)** — the grid ruler labels follow. |
-| **Transform** | Rotate/translate/scale the whole object with the gizmo or numeric fields. Nothing touches the mesh until **Apply transform** bakes it into the vertex data (like Blender's *Apply Transform*). |
-| **Segment** | Slice the mesh into an **N×M grid on any two axes** (per-triangle centroid assignment — no cracks). Click a cell to select it (Shift = add, drag = rect-select), then move/rotate/scale the selection with the gizmo; the whole block moves **rigidly** and the borders **blend smoothly** (adjustable falloff). |
+| **Info** | Orbit (LMB), pan (RMB), zoom (wheel). Model info, mesh picker, **unit switch (m / cm)** — the grid ruler labels follow. |
+| **Transform** | Rotate/translate/scale the whole object with the gizmo or numeric fields. Nothing touches the mesh until **Apply transform** bakes it into the vertex data (like Blender's *Apply Transform*). Planar scale handles (XY/YZ/XZ) use one shared ratio for both axes. |
+| **FFD** | A 3D lattice wraps the model. Click control points (Shift = add, drag = rect-select) and move/rotate/scale them with the gizmo to deform the surface smoothly. **Collapse** bakes the current cage into the mesh, so the next lattice wraps the collapsed shape. |
 | **Floor** | Create a floor plane you can **move / rotate / scale directly in the viewport** (Translate/Rotate/Scale gizmo, T/R/S buttons in the panel) or via numeric fields (width/depth/height/center, spin/tilt, "Fit to model", "Floor @ bottom"). The plane may be tilted — leveling works along the plane's own normal. **Scan intersections** finds and highlights every area of the mesh crossing/below the plane inside its footprint (connected areas, numbered). Select one (click / Shift-click / rect) and level it: **Drop** = rigid translate along the plane normal until the lowest point touches it; **Flatten** = vertices below the plane are pulled onto it. Both blend with a smooth falloff band and clamp band vertices so nothing stays underground. Repeat steps 2–7 as often as you like — every operation is undoable (Ctrl+Z / Ctrl+Shift+Z). |
 | **Ref Image** | Load an image as a guide plane (horizontal/vertical, opacity slider, translate/rotate/scale via gizmo or fields). Purely a visual guide. |
 
@@ -50,13 +50,13 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
 
 | Key | Action |
 | --- | --- |
-| `Q` | Select tool (leaves any manipulator) |
+| `Q` | Info / Select tool (leaves any manipulator) |
 | `W` | **Move** (translate) the active object |
 | `E` | **Rotate** the active object |
 | `R` | **Scale** the active object |
 | `Tab` | Cycle the active object's Move → Rotate → Scale |
 
-"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Select tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` toggles ortho, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
+"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Info (Select) tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` toggles ortho, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
 
 ## Export
 
@@ -87,12 +87,13 @@ src/
   importer.ts      glb/gltf/fbx/obj → flat group, import transform baked
   exporter.ts      glb/obj export + optional normalization
   transformTool.ts whole-object pending transform + apply (R2)
-  segmentTool.ts   N×M segmentation, selection, gizmo deform (R4)
+  ffdTool.ts       lattice lifecycle, control-point selection, gizmo deform
+  ffd.ts           Bernstein–Bézier lattice math
   floorTool.ts     floor plane, intersection scan, drop/flatten (R5–R7)
   refTool.ts       reference image plane (R3)
   falloff.ts       welded adjacency, selection falloff, vertex weights
   leveling.ts      plane intersection, drop/flatten math
   history.ts       undo/redo stack
   ui.ts            DOM helpers, toasts, modals
-scripts/smoke.mjs  headless end-to-end test (99 checks)
+scripts/smoke.mjs  headless end-to-end test (103 checks)
 ```

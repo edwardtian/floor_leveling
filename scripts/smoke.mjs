@@ -489,7 +489,7 @@ await page.evaluate(() => { window.__FL__.floorTool.resetTransform(); window.__F
 await page.click('#tool-model');
 await page.waitForTimeout(300);
 const modelTabs = await page.evaluate(() => [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent));
-ok('model subtabs Select/Transform/FFD', modelTabs.join(',') === 'Select,Transform,FFD', JSON.stringify(modelTabs));
+ok('model subtabs Info/Transform/FFD', modelTabs.join(',') === 'Info,Transform,FFD', JSON.stringify(modelTabs));
 await page.click('#tool-floor');
 await page.waitForTimeout(200);
 const floorTabs = await page.evaluate(() => [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent));
@@ -1398,6 +1398,182 @@ ok('export normalization keeps multi-mesh relative placement',
   exportNorm[0] < 0 && exportNorm[1] > 0 &&
   Math.abs(exportNorm[0] + 0.2778) < 1e-3 && Math.abs(exportNorm[1] - 0.3889) < 1e-3,
   JSON.stringify(exportNorm));
+
+// ---- FFD Collapse must bake the CURRENT cage, so a rebuild wraps the
+// collapsed shape rather than the original mesh.
+const ffdCollapseBake = await page.evaluate(() => {
+  const { ffdTool: d, meshes, THREE } = window.__FL__;
+  const mesh = meshes[0];
+  const height = () => {
+    mesh.geometry.computeBoundingBox();
+    return mesh.geometry.boundingBox.getSize(new THREE.Vector3()).y;
+  };
+  window.__FL__.setTool('ffd');
+  d.collapse(); // clean slate (no-op when there is no lattice)
+  d.build();
+  const before = height();
+  // Modify the cage directly, WITHOUT applying the deformation to the mesh:
+  // Collapse itself must bake it.
+  for (let i = 0; i < d.lattice.nx; i++) {
+    for (let k = 0; k < d.lattice.nz; k++) {
+      const id = d.lattice.index(i, d.lattice.ny - 1, k);
+      d.lattice.controlPoints[id * 3 + 1] += 4;
+    }
+  }
+  d.collapse();
+  const collapsed = height();
+  d.build();
+  const cage = (() => {
+    const b = new THREE.Box3();
+    const cp = d.lattice.controlPoints;
+    for (let i = 0; i < d.lattice.count; i++) {
+      b.expandByPoint(new THREE.Vector3(cp[i * 3], cp[i * 3 + 1], cp[i * 3 + 2]));
+    }
+    return b.getSize(new THREE.Vector3()).y;
+  })();
+  return { before, collapsed, cage };
+});
+ok('FFD Collapse bakes the current cage; rebuild wraps the collapsed shape',
+  ffdCollapseBake.collapsed > ffdCollapseBake.before + 2 &&
+  ffdCollapseBake.cage > ffdCollapseBake.collapsed,
+  JSON.stringify(ffdCollapseBake));
+
+// ---- Rebuilding with new dimensions must recreate the cage/point buffers.
+// Reusing the old InstancedMesh/cage index leaves ghost points and a stale
+// cage until a tab switch disposes/recreates the visuals.
+const ffdVisualRebuild = await page.evaluate(() => {
+  const { ffdTool: d, THREE } = window.__FL__;
+  window.__FL__.setTool('ffd');
+  d.collapse();
+  d.settings.nx = 3; d.settings.ny = 3; d.settings.nz = 3;
+  d.build();
+  const before = { points: d.pointsMesh?.count, cageIndex: d.cageGeo?.index?.count };
+  d.settings.nx = 4; d.settings.ny = 4; d.settings.nz = 4;
+  d.build();
+  const after = { points: d.pointsMesh?.count, cageIndex: d.cageGeo?.index?.count };
+  // build() clears the selection; reused visuals must still be repainted.
+  d.selectAll();
+  d.build();
+  const c = new THREE.Color();
+  d.pointsMesh.getColorAt(0, c);
+  const colorAfterBuild = c.getHex();
+  // Restore 3×3×3 for the remaining tests/screenshot.
+  d.settings.nx = 3; d.settings.ny = 3; d.settings.nz = 3;
+  d.build();
+  return { before, after, colorAfterBuild, red: 0xff5f5f, selected: d.selected.size };
+});
+ok('FFD rebuild recreates cage/point buffers for new dimensions',
+  ffdVisualRebuild.before.points === 27 && ffdVisualRebuild.after.points === 64 &&
+  ffdVisualRebuild.after.cageIndex > ffdVisualRebuild.before.cageIndex &&
+  ffdVisualRebuild.colorAfterBuild !== ffdVisualRebuild.red,
+  JSON.stringify(ffdVisualRebuild));
+
+// ---- Axis colors on the FFD lattice and Floor fields.
+const axisFieldColors = await page.evaluate(() => {
+  const colorOf = (label) => {
+    const row = [...document.querySelectorAll('#panel-body .row')]
+      .find((r) => r.querySelector('label')?.textContent === label);
+    const lab = row?.querySelector('label');
+    return lab ? getComputedStyle(lab).color : null;
+  };
+  window.__FL__.setTool('floor');
+  const floor = {
+    x: colorOf('Width X'), z: colorOf('Depth Z'), y: colorOf('Height Y'),
+    cx: colorOf('Center X'), cz: colorOf('Center Z'),
+  };
+  window.__FL__.setTool('ffd');
+  const ffd = { x: colorOf('X'), y: colorOf('Y'), z: colorOf('Z') };
+  return { floor, ffd };
+});
+const RED = 'rgb(224, 85, 78)';
+const GREEN = 'rgb(139, 195, 74)';
+const BLUE = 'rgb(66, 165, 245)';
+ok('FFD lattice and Floor axis fields use X/Y/Z colors',
+  axisFieldColors.ffd.x === RED && axisFieldColors.ffd.y === GREEN && axisFieldColors.ffd.z === BLUE &&
+  axisFieldColors.floor.x === RED && axisFieldColors.floor.cx === RED &&
+  axisFieldColors.floor.y === GREEN &&
+  axisFieldColors.floor.z === BLUE && axisFieldColors.floor.cz === BLUE,
+  JSON.stringify(axisFieldColors));
+
+// ---- Planar scale handles (XY/YZ/XZ) must use ONE shared factor for both
+// axes, not TransformControls' independent per-axis factors.
+const planarScaleProbe = await page.evaluate(() => {
+  const { floorTool: f, transformTool: tt, refTool: r, ffdTool: d, editor, THREE } = window.__FL__;
+  const dragPending = (nt, s) => {
+    editor.gizmoDragging = true;
+    editor.gizmo.axis = 'XZ';
+    nt.onGizmoStart();
+    nt.proxy.scale.set(s[0], s[1], s[2]);
+    nt.onGizmoChange('scale');
+    editor.gizmoDragging = false;
+    editor.gizmo.axis = null;
+    return { sx: nt.pending.sx, sy: nt.pending.sy, sz: nt.pending.sz };
+  };
+  window.__FL__.setTool('floor');
+  f.resetTransform();
+  f.nodeTransform.attachGizmo('scale');
+  f.planeVisuals.plane.parent.rotation.set(0, 0, 0);
+  f.updatePlane();
+  const floorXZ = dragPending(f.nodeTransform, [2, 1, 3]);
+  f.resetTransform();
+
+  window.__FL__.setTool('transform');
+  tt.resetPending();
+  editor.gizmoDragging = true;
+  editor.gizmo.axis = 'XZ';
+  tt.gizmoMode = 'scale';
+  tt.onGizmoDragStart();
+  tt.proxy.scale.set(2, 1, 3);
+  tt.onGizmoChange();
+  editor.gizmoDragging = false;
+  editor.gizmo.axis = null;
+  const modelXZ = { sx: tt.pending.sx, sy: tt.pending.sy, sz: tt.pending.sz };
+  tt.resetPending();
+
+  window.__FL__.setTool('ref');
+  r.resetTransform(); // clear the pending size left by the aspect test
+  r.nodeTransform.attachGizmo('scale');
+  const refXZ = dragPending(r.nodeTransform, [2, 1, 3]);
+
+  window.__FL__.setTool('ffd');
+  d.collapse();
+  d.build();
+  d.selectAll();
+  d.setGizmoMode('scale');
+  const extents = () => {
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    const cp = d.lattice.controlPoints;
+    for (let i = 0; i < d.lattice.count; i++) {
+      const x = cp[i * 3], z = cp[i * 3 + 2];
+      if (x < minX) minX = x; if (x > maxX) maxX = x;
+      if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+    }
+    return { x: maxX - minX, z: maxZ - minZ };
+  };
+  const before = extents();
+  editor.gizmo.axis = 'XZ';
+  d.beginGizmoDrag();
+  d.gizmoProxy.scale.set(2, 1, 3);
+  d.updateGizmoDrag();
+  d.endGizmoDrag();
+  editor.gizmo.axis = null;
+  const after = extents();
+  return {
+    floorXZ, modelXZ, refXZ,
+    ffdRatio: { x: after.x / before.x, z: after.z / before.z },
+  };
+});
+ok('planar scale uses one shared ratio for both axes',
+  Math.abs(planarScaleProbe.floorXZ.sx - 2.5) < 1e-6 &&
+  Math.abs(planarScaleProbe.floorXZ.sz - 2.5) < 1e-6 &&
+  Math.abs(planarScaleProbe.floorXZ.sy - 1) < 1e-6 &&
+  Math.abs(planarScaleProbe.modelXZ.sx - 2.5) < 1e-6 &&
+  Math.abs(planarScaleProbe.modelXZ.sz - 2.5) < 1e-6 &&
+  Math.abs(planarScaleProbe.refXZ.sx - 2.5) < 1e-6 &&
+  Math.abs(planarScaleProbe.refXZ.sz - 2.5) < 1e-6 &&
+  Math.abs(planarScaleProbe.ffdRatio.x - 2.5) < 1e-3 &&
+  Math.abs(planarScaleProbe.ffdRatio.z - 2.5) < 1e-3,
+  JSON.stringify(planarScaleProbe));
 
 await page.screenshot({ path: `${ROOT}/.smoke/09-final.png` });
 

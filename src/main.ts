@@ -210,7 +210,7 @@ async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
 
 /**
  * Top-level object tabs: Model, Floor, Ref Image.
- * The Model tab hosts vertical sub-panels: Select / Transform / FFD.
+ * The Model tab hosts vertical sub-panels: Info / Transform / FFD.
  */
 type ObjectTab = 'model' | 'floor' | 'ref';
 type ModelSub = 'select' | 'transform' | 'ffd';
@@ -285,7 +285,8 @@ function applyToolState(): void {
   };
   if (currentTool === 'model') {
     for (const s of ['select', 'transform', 'ffd'] as const) {
-      addSub(s === 'ffd' ? 'FFD' : s[0].toUpperCase() + s.slice(1), s === modelSub, () => setTool(s));
+      const label = s === 'select' ? 'Info' : s === 'ffd' ? 'FFD' : s[0].toUpperCase() + s.slice(1);
+      addSub(label, s === modelSub, () => setTool(s));
     }
   } else if (currentTool === 'floor') {
     addSub('Floor', floorSub === 'floor', () => { floorSub = 'floor'; applyToolState(); });
@@ -425,7 +426,7 @@ function manipulatorCtx(): ManipulatorCtx | null {
       ready: meshes.length > 0,
     };
   }
-  return null; // Select sub-panel: no manipulator active yet
+  return null; // Info sub-panel: no manipulator active yet
 }
 
 const MODE_LABELS = { translate: 'Move', rotate: 'Rotate', scale: 'Scale' } as const;
@@ -433,7 +434,7 @@ const MODE_LABELS = { translate: 'Move', rotate: 'Rotate', scale: 'Scale' } as c
 /**
  * Q/W/E/R/Tab act on the CURRENT object's manipulator: the model (Transform
  * or FFD tool), the floor plane, or the reference image. Q always returns to
- * the Select tool; Tab cycles the active object's Translate/Rotate/Scale.
+ * the Info (Select) tool; Tab cycles the active object's Translate/Rotate/Scale.
  * Skipped while typing in fields or when a modal is open.
  */
 function handleManipulatorKey(e: KeyboardEvent): void {
@@ -456,7 +457,7 @@ function handleManipulatorKey(e: KeyboardEvent): void {
 
   const ctx = manipulatorCtx();
   if (!ctx) {
-    // Select tool: W/E/R/Tab activate the model manipulator.
+    // Info panel: W/E/R/Tab activate the model manipulator.
     if (!meshes.length) return;
     setTool('transform');
     const mode = isW ? 'translate' : isE ? 'rotate' : isR ? 'scale' : 'translate';
@@ -795,15 +796,25 @@ function buildFFDPanel(): void {
 
   const gl = group('Lattice', panelBody);
   const rowDim = el('div', 'row');
-  rowDim.appendChild(numField('X', s.nx, (v) => { s.nx = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20 }));
-  rowDim.appendChild(numField('Y', s.ny, (v) => { s.ny = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20 }));
-  rowDim.appendChild(numField('Z', s.nz, (v) => { s.nz = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20 }));
+  rowDim.appendChild(numField('X', s.nx, (v) => { s.nx = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20, axis: 'x' }));
+  rowDim.appendChild(numField('Y', s.ny, (v) => { s.ny = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20, axis: 'y' }));
+  rowDim.appendChild(numField('Z', s.nz, (v) => { s.nz = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20, axis: 'z' }));
   gl.body.appendChild(rowDim);
   gl.body.appendChild(slider('Cage margin', s.margin, 0, 0.3, 0.01, (v) => { s.margin = v; if (ffdTool.lattice) rebuildFFD(); }));
   const rowL = el('div', 'row');
-  rowL.appendChild(button(ffdTool.lattice ? 'Rebuild lattice' : 'Create lattice', () => rebuildFFD(), 'btn primary'));
+  const latticeBtn = button(ffdTool.lattice ? 'Rebuild lattice' : 'Create lattice', () => rebuildFFD(), 'btn primary');
+  latticeBtn.id = 'ffd-lattice-btn';
+  rowL.appendChild(latticeBtn);
   rowL.appendChild(button('Reset', () => { ffdTool.reset(); toast('Lattice reset to the rest cage.', 'ok'); }));
-  rowL.appendChild(button('Collapse', () => { ffdTool.collapse(); toast('Lattice removed — shape stays as deformed.', 'ok'); }));
+  rowL.appendChild(button('Collapse', () => {
+    if (!ffdTool.lattice) {
+      toast('No lattice to collapse.', 'info');
+      return;
+    }
+    ffdTool.collapse();
+    refreshFFDLatticeButton();
+    toast('Lattice removed — shape stays as deformed.', 'ok');
+  }));
   gl.body.appendChild(rowL);
   gl.body.appendChild(hint('The lattice wraps the whole model. Click control points to select (Shift = add), drag on empty space for a rect, then drag the gizmo: the surface deforms smoothly.'));
 
@@ -837,7 +848,14 @@ function rebuildFFD(): void {
   if (ffdTool.build()) {
     toast(`FFD lattice ${ffdTool.settings.nx}×${ffdTool.settings.ny}×${ffdTool.settings.nz} created.`, 'ok');
   }
+  refreshFFDLatticeButton();
   refreshFFDInfo();
+}
+
+/** Keep the primary lattice button label in sync with the tool state. */
+function refreshFFDLatticeButton(): void {
+  const b = document.getElementById('ffd-lattice-btn') as HTMLButtonElement | null;
+  if (b) b.textContent = ffdTool.lattice ? 'Rebuild lattice' : 'Create lattice';
 }
 
 function refreshFFDInfo(): void {
@@ -872,11 +890,11 @@ function buildFloorPanel(): void {
   // model / floor / ref image.
   const nt = floorTool.nodeTransform;
   const previewed = () => nt.previewedTRS();
-  const fx = unitField('Width X', s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); });
-  const fz = unitField('Depth Z', s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); });
-  const fy = unitField('Height Y', s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); });
-  const fcx = unitField('Center X', s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); });
-  const fcz = unitField('Center Z', s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); });
+  const fx = unitField('Width X', s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); }, { axis: 'x' });
+  const fz = unitField('Depth Z', s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); }, { axis: 'z' });
+  const fy = unitField('Height Y', s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); }, { axis: 'y' });
+  const fcx = unitField('Center X', s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); }, { axis: 'x' });
+  const fcz = unitField('Center Z', s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); }, { axis: 'z' });
   const rot = numField('Spin / tilt (deg)', floorTool.rotationDeg.y, (v) => nt.setWorldRotationDeg({ y: v }), { step: 1 });
   const sync = () => {
     const trs = previewed();

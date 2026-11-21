@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { Editor } from './editor';
 import type { MeshData, FFDSettings } from './types';
 import { FFDLattice } from './ffd';
+import { planarScaleRatios } from './transform';
 import type { History } from './history';
 
 /**
@@ -42,6 +43,8 @@ export class FFDTool {
   private cageGeo: THREE.BufferGeometry | null = null;
   private pointsMesh: THREE.InstancedMesh | null = null;
   private pointsGeo: THREE.BufferGeometry | null = null;
+  /** Dimensions + point radius the current visual buffers were built for. */
+  private visualSignature = '';
 
   // Gizmo drag state
   readonly gizmoProxy = new THREE.Object3D();
@@ -84,6 +87,9 @@ export class FFDTool {
     this.gizmoProxy.scale.set(1, 1, 1);
     this.ensureVisuals();
     this.syncVisuals();
+    // build() clears the selection; repaint even when the visual buffers were
+    // reused (same dimensions), otherwise old red points stay red.
+    this.paintSelection();
     this.onChanged();
     return true;
   }
@@ -122,9 +128,15 @@ export class FFDTool {
 
   /** Drop the lattice entirely (mesh keeps its current baked shape). */
   collapse(): void {
+    if (!this.lattice) return;
+    // Bake the CURRENT cage into the mesh before dropping it. The gizmo path
+    // already writes on every drag, but this makes Collapse self-contained:
+    // a subsequent build() must wrap the collapsed shape, never the original.
+    this.applyDeform();
     this.lattice = null;
     this.local = null;
     this.basePositions = null;
+    this.buildChecksum = '';
     this.selected.clear();
     this.disposeVisuals();
     this.editor.detachGizmo();
@@ -192,8 +204,17 @@ export class FFDTool {
   // ---------- visuals ----------
 
   private ensureVisuals(): void {
-    if (this.cageLines) return;
-    const lat = this.lattice!;
+    const lat = this.lattice;
+    if (!lat) return;
+    // The cage index buffer and the InstancedMesh instance count are sized for
+    // a specific nx×ny×nz (and the sphere radius for the lattice box). Reusing
+    // them after a Rebuild with different dimensions writes out of bounds or
+    // leaves ghost points/lines — the stale cage the user sees until a tab
+    // switch disposes/recreates the visuals. Recreate when the signature moves.
+    const signature = `${lat.nx}x${lat.ny}x${lat.nz}|${this.pointRadius().toFixed(6)}`;
+    if (this.cageLines && this.pointsMesh && this.visualSignature === signature) return;
+    this.disposeVisuals();
+    this.visualSignature = signature;
     // Line cage: segments between adjacent control points along each axis.
     const segs: number[] = [];
     for (let i = 0; i < lat.nx; i++) {
@@ -268,6 +289,7 @@ export class FFDTool {
   }
 
   private disposeVisuals(): void {
+    this.visualSignature = '';
     if (this.cageLines) {
       this.editor.overlayGroup.remove(this.cageLines);
       (this.cageLines.material as THREE.Material).dispose();
@@ -428,10 +450,12 @@ export class FFDTool {
       }
     } else {
       const s = g.scale;
+      // Planar handles (XY/YZ/XZ) use ONE shared factor for both axes.
+      const r = planarScaleRatios(this.editor.gizmo.axis, s.x, s.y, s.z);
       for (const id of this.selected) {
-        lat.controlPoints[id * 3] = p.x + (this.dragStartCage[id * 3] - p.x) * s.x;
-        lat.controlPoints[id * 3 + 1] = p.y + (this.dragStartCage[id * 3 + 1] - p.y) * s.y;
-        lat.controlPoints[id * 3 + 2] = p.z + (this.dragStartCage[id * 3 + 2] - p.z) * s.z;
+        lat.controlPoints[id * 3] = p.x + (this.dragStartCage[id * 3] - p.x) * r.x;
+        lat.controlPoints[id * 3 + 1] = p.y + (this.dragStartCage[id * 3 + 1] - p.y) * r.y;
+        lat.controlPoints[id * 3 + 2] = p.z + (this.dragStartCage[id * 3 + 2] - p.z) * r.z;
       }
     }
 

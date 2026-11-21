@@ -29,6 +29,34 @@ export function transformChanged(t: TransformValues): boolean {
   );
 }
 
+/**
+ * TransformControls' planar scale handles (XY/YZ/XZ) compute an INDEPENDENT
+ * factor per axis, so dragging diagonally stretches one axis more than the
+ * other. A plane handle should scale both axes by the same ratio: average the
+ * two per-axis factors and apply that single factor to both.
+ * Single-axis handles and the uniform XYZ handle pass through unchanged.
+ */
+export function planarScaleRatios(
+  axis: string | null | undefined,
+  rx: number,
+  ry: number,
+  rz: number,
+): { x: number; y: number; z: number } {
+  if (axis === 'XY') {
+    const r = (rx + ry) / 2;
+    return { x: r, y: r, z: 1 };
+  }
+  if (axis === 'YZ') {
+    const r = (ry + rz) / 2;
+    return { x: 1, y: r, z: r };
+  }
+  if (axis === 'XZ') {
+    const r = (rx + rz) / 2;
+    return { x: r, y: 1, z: r };
+  }
+  return { x: rx, y: ry, z: rz };
+}
+
 /** Rotation pivot: bounding-box center of the current (already baked) geometry. */
 export function geometryCenter(mesh: MeshData): THREE.Vector3 {
   mesh.geometry.computeBoundingBox();

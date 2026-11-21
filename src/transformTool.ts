@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
 import type { MeshData, PendingTransform } from './types';
-import { DEFAULT_TRANSFORM, geometryCenter } from './transform';
+import { DEFAULT_TRANSFORM, geometryCenter, planarScaleRatios } from './transform';
 import type { History } from './history';
 
 /**
@@ -185,9 +185,10 @@ export class TransformTool {
       const rx = ds.s.x !== 0 ? this.proxy.scale.x / ds.s.x : 1;
       const ry = ds.s.y !== 0 ? this.proxy.scale.y / ds.s.y : 1;
       const rz = ds.s.z !== 0 ? this.proxy.scale.z / ds.s.z : 1;
-      this.pending.sx = ds.pending.sx * rx;
-      this.pending.sy = ds.pending.sy * ry;
-      this.pending.sz = ds.pending.sz * rz;
+      const r = planarScaleRatios(this.editor.gizmo.axis, rx, ry, rz);
+      this.pending.sx = ds.pending.sx * r.x;
+      this.pending.sy = ds.pending.sy * r.y;
+      this.pending.sz = ds.pending.sz * r.z;
     }
     this.preview();
     this.onChanged();
