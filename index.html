@@ -9,24 +9,29 @@
   <div id="app">
     <div id="viewport"></div>
     <div id="topbar">
-      <button id="btn-import" class="btn">Import…</button>
-      <button id="btn-export-glb" class="btn" disabled>Export GLB</button>
-      <button id="btn-export-obj" class="btn" disabled>Export OBJ</button>
+      <button id="btn-import" class="btn" data-i18n="topbar.import">Import…</button>
+      <button id="btn-export-glb" class="btn" disabled data-i18n="topbar.exportGlb">Export GLB</button>
+      <button id="btn-export-obj" class="btn" disabled data-i18n="topbar.exportObj">Export OBJ</button>
       <span class="sep"></span>
-      <button id="btn-undo" class="btn" title="Ctrl+Z">Undo</button>
-      <button id="btn-redo" class="btn" title="Ctrl+Shift+Z">Redo</button>
+      <button id="btn-undo" class="btn" title="Ctrl+Z" data-i18n="topbar.undo">Undo</button>
+      <button id="btn-redo" class="btn" title="Ctrl+Shift+Z" data-i18n="topbar.redo">Redo</button>
       <span class="sep"></span>
-      <label class="chk"><input type="checkbox" id="chk-showfloor" /> Floor</label>
-      <label class="chk"><input type="checkbox" id="chk-showref" /> Ref</label>
-      <label class="chk"><input type="checkbox" id="chk-showwires" /> Wire</label>
-      <label class="chk"><input type="checkbox" id="chk-showgrid" checked /> Grid</label>
+      <label class="chk"><input type="checkbox" id="chk-showfloor" checked /> <span data-i18n="topbar.floor">Floor</span></label>
+      <label class="chk"><input type="checkbox" id="chk-showref" /> <span data-i18n="topbar.ref">Ref</span></label>
+      <label class="chk"><input type="checkbox" id="chk-showwires" /> <span data-i18n="topbar.wire">Wire</span></label>
+      <label class="chk"><input type="checkbox" id="chk-showgrid" checked /> <span data-i18n="topbar.grid">Grid</span></label>
+      <label class="chk"><input type="checkbox" id="chk-showlabels" checked /> <span data-i18n="topbar.label">Label</span></label>
       <span class="sep"></span>
       <span id="status" class="status">Import a model to begin.</span>
+      <span id="lang-switch" class="lang-switch" role="group" data-i18n-aria="lang.aria" aria-label="Language">
+        <button type="button" data-lang="en" class="active">EN</button>
+        <button type="button" data-lang="zh">中文</button>
+      </span>
     </div>
     <div id="toolbar">
-      <button id="tool-model" class="tbtn active" title="Model tools: Select, Transform, FFD">Model</button>
-      <button id="tool-floor" class="tbtn" title="Floor plane + leveling">Floor</button>
-      <button id="tool-ref" class="tbtn" title="Reference image">Ref Image</button>
+      <button id="tool-model" class="tbtn active" data-i18n="toolbar.model" data-i18n-title="toolbar.modelTitle" title="Model tools: Select, Transform, FFD">Model</button>
+      <button id="tool-floor" class="tbtn" data-i18n="toolbar.floor" data-i18n-title="toolbar.floorTitle" title="Floor plane + leveling">Floor</button>
+      <button id="tool-ref" class="tbtn" data-i18n="toolbar.ref" data-i18n-title="toolbar.refTitle" title="Reference image">Ref Image</button>
     </div>
     <div id="panel">
       <div id="panel-title">Model</div>

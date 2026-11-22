@@ -526,9 +526,10 @@ ok('ref subtabs Image/Transform', refTabs.join(',') === 'Image,Transform', JSON.
 await page.click('#subtabs button:has-text("Transform")');
 await page.waitForTimeout(200);
 const refGroups = await page.evaluate(() => [...document.querySelectorAll('#panel-body .gtitle')].map((b) => b.textContent));
-ok('ref Transform panel groups match model', JSON.stringify(refGroups) === JSON.stringify(['Gizmo', 'Rotation (degrees)', 'Translation', 'Scale', 'Apply']), JSON.stringify(refGroups));
+ok('ref Transform panel groups match model', JSON.stringify(refGroups) === JSON.stringify(['Gizmo', 'Rotation (2D)', 'Translation', 'Scale', 'Apply']), JSON.stringify(refGroups));
 await page.evaluate(() => {
   const r = window.__FL__.refTool;
+  window.__refBeforeY = r.group.position.y;
   r.nodeTransform.onGizmoStart();
   r.nodeTransform.proxy.position.y += 0.2;
   r.nodeTransform.onGizmoChange('translate');
@@ -539,9 +540,9 @@ await page.click('#panel-body button:has-text("Apply transform")');
 await page.waitForTimeout(300);
 const refApplied = await page.evaluate(() => {
   const r = window.__FL__.refTool;
-  return { pending: r.hasPendingTransform(), y: r.group.position.y };
+  return { pending: r.hasPendingTransform(), y: r.group.position.y, before: window.__refBeforeY };
 });
-ok('ref Apply bakes transform', !refApplied.pending && Math.abs(refApplied.y - 0.2) < 1e-3, JSON.stringify(refApplied));
+ok('ref Apply bakes transform', !refApplied.pending && Math.abs(refApplied.y - refApplied.before - 0.2) < 1e-3, JSON.stringify(refApplied));
 await page.click('#subtabs button:has-text("Image")');
 await page.waitForTimeout(200);
 
@@ -559,13 +560,68 @@ await page.waitForTimeout(200);
 const floorChk2 = await page.evaluate(() => ({
   checked: document.getElementById('chk-showfloor').checked,
   planeVisible: window.__FL__.floorTool.planeVisuals.plane.visible,
+  labelVisible: window.__FL__.floorTool.floorLabelVisible,
 }));
-ok('Floor checkbox tracks + hides plane', floorChk1 === true && floorChk2.checked === false && floorChk2.planeVisible === false, JSON.stringify({ floorChk1, floorChk2 }));
+ok('Floor checkbox tracks + hides plane and its tag',
+  floorChk1 === true && floorChk2.checked === false && floorChk2.planeVisible === false && floorChk2.labelVisible === false,
+  JSON.stringify({ floorChk1, floorChk2 }));
 await page.evaluate(() => {
   const cb = document.getElementById('chk-showfloor');
   cb.checked = true;
   cb.dispatchEvent(new Event('change'));
 });
+await page.waitForTimeout(200);
+const floorChk3 = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showfloor').checked,
+  planeVisible: window.__FL__.floorTool.planeVisuals.plane.visible,
+  labelVisible: window.__FL__.floorTool.floorLabelVisible,
+}));
+ok('Floor checkbox restores plane and its tag',
+  floorChk3.checked && floorChk3.planeVisible && floorChk3.labelVisible,
+  JSON.stringify(floorChk3));
+
+// The Floor toggle is global: in Model mode it must still show/hide the
+// plane and its outline (the floor tag stays a Floor-tool annotation).
+await page.click('#tool-model');
+await page.waitForTimeout(250);
+const modelFloorOn = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showfloor').checked,
+  planeVisible: window.__FL__.floorTool.planeVisuals.plane.visible,
+  outlineVisible: window.__FL__.floorTool.planeVisuals.outline.visible,
+  labelVisible: window.__FL__.floorTool.floorLabelVisible,
+}));
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showfloor');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(150);
+const modelFloorOff = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showfloor').checked,
+  planeVisible: window.__FL__.floorTool.planeVisuals.plane.visible,
+  outlineVisible: window.__FL__.floorTool.planeVisuals.outline.visible,
+  labelVisible: window.__FL__.floorTool.floorLabelVisible,
+}));
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showfloor');
+  cb.checked = true;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(150);
+const modelFloorBack = await page.evaluate(() => ({
+  checked: document.getElementById('chk-showfloor').checked,
+  planeVisible: window.__FL__.floorTool.planeVisuals.plane.visible,
+  outlineVisible: window.__FL__.floorTool.planeVisuals.outline.visible,
+}));
+ok('Floor toggle renders/hides the floor in Model mode',
+  modelFloorOn.checked && modelFloorOn.planeVisible && modelFloorOn.outlineVisible &&
+  !modelFloorOn.labelVisible &&
+  !modelFloorOff.checked && !modelFloorOff.planeVisible && !modelFloorOff.outlineVisible &&
+  modelFloorBack.checked && modelFloorBack.planeVisible && modelFloorBack.outlineVisible,
+  JSON.stringify({ modelFloorOn, modelFloorOff, modelFloorBack }));
+await page.click('#tool-floor');
+await page.waitForTimeout(250);
+
 // Ref checkbox: image loaded in an earlier test; hide via setVisible → checkbox follows
 await page.evaluate(() => {
   window.__FL__.refTool.setVisible(false);
@@ -628,6 +684,127 @@ const gridOn = await page.evaluate(() => ({
   visible: window.__FL__.editor.isGridVisible,
 }));
 ok('Grid checkbox tracks grid visibility', !gridOff.checked && !gridOff.visible && gridOn.checked && gridOn.visible, JSON.stringify({ gridOff, gridOn }));
+
+// Label checkbox: hides 3D text labels (grid numbers/captions + floor tag)
+// while keeping grid lines/axes visible.
+const labelsDefault = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  const texts = [];
+  let allVisible = true;
+  let count = 0;
+  ed.helperGroup.traverse((o) => {
+    if (o.userData && o.userData.isLabel) {
+      count++;
+      texts.push(o.userData.labelText);
+      if (!o.visible) allVisible = false;
+    }
+  });
+  return {
+    checked: document.getElementById('chk-showlabels').checked,
+    labelsVisible: ed.isLabelsVisible,
+    count,
+    allVisible,
+    hasX: texts.includes('X (m)'),
+    hasZ: texts.includes('Z (m)'),
+    hasNumber: texts.some((t) => /^\d+(\.\d+)?$/.test(t)),
+    floorLabelVisible: window.__FL__.floorTool.floorLabelVisible,
+    gridVisible: ed.isGridVisible,
+  };
+});
+ok('Label toggle exists; grid + floor labels are visible by default',
+  labelsDefault.checked && labelsDefault.labelsVisible && labelsDefault.count > 2 &&
+  labelsDefault.allVisible && labelsDefault.hasX && labelsDefault.hasZ &&
+  labelsDefault.hasNumber && labelsDefault.floorLabelVisible && labelsDefault.gridVisible,
+  JSON.stringify(labelsDefault));
+
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showlabels');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const labelsOff = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  let anyVisible = false;
+  let count = 0;
+  ed.helperGroup.traverse((o) => {
+    if (o.userData && o.userData.isLabel) {
+      count++;
+      if (o.visible) anyVisible = true;
+    }
+  });
+  let nonLabelVisible = false;
+  for (const c of ed.helperGroup.children) {
+    if (!(c.userData && c.userData.isLabel) && c.visible) nonLabelVisible = true;
+  }
+  return {
+    checked: document.getElementById('chk-showlabels').checked,
+    labelsVisible: ed.isLabelsVisible,
+    count,
+    anyVisible,
+    floorLabelVisible: window.__FL__.floorTool.floorLabelVisible,
+    gridGroupVisible: ed.helperGroup.visible,
+    nonLabelVisible,
+  };
+});
+ok('Label off hides grid numbers/captions + floor tag, keeps grid lines',
+  !labelsOff.checked && !labelsOff.labelsVisible && labelsOff.count > 2 &&
+  !labelsOff.anyVisible && !labelsOff.floorLabelVisible &&
+  labelsOff.gridGroupVisible && labelsOff.nonLabelVisible,
+  JSON.stringify(labelsOff));
+
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showlabels');
+  cb.checked = true;
+  cb.dispatchEvent(new Event('change'));
+});
+await page.waitForTimeout(200);
+const labelsBack = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  let allVisible = true;
+  let count = 0;
+  ed.helperGroup.traverse((o) => {
+    if (o.userData && o.userData.isLabel) {
+      count++;
+      if (!o.visible) allVisible = false;
+    }
+  });
+  return {
+    checked: document.getElementById('chk-showlabels').checked,
+    labelsVisible: ed.isLabelsVisible,
+    count,
+    allVisible,
+    floorLabelVisible: window.__FL__.floorTool.floorLabelVisible,
+  };
+});
+ok('Label on restores grid labels + floor tag',
+  labelsBack.checked && labelsBack.labelsVisible && labelsBack.count > 2 &&
+  labelsBack.allVisible && labelsBack.floorLabelVisible,
+  JSON.stringify(labelsBack));
+
+// The axis captions follow the m/cm unit switch.
+const unitLabels = await page.evaluate(() => {
+  const read = () => {
+    const texts = [];
+    window.__FL__.editor.helperGroup.traverse((o) => {
+      if (o.userData && o.userData.isLabel) texts.push(o.userData.labelText);
+    });
+    return texts;
+  };
+  window.__FL__.setUnits('centimeter');
+  const cm = read();
+  window.__FL__.setUnits('meter');
+  const m = read();
+  return {
+    cmHasX: cm.includes('X (cm)'),
+    cmHasZ: cm.includes('Z (cm)'),
+    mHasX: m.includes('X (m)'),
+    mHasZ: m.includes('Z (m)'),
+  };
+});
+ok('grid unit captions switch between X/Z (m) and X/Z (cm)',
+  unitLabels.cmHasX && unitLabels.cmHasZ && unitLabels.mHasX && unitLabels.mHasZ,
+  JSON.stringify(unitLabels));
 await page.evaluate(() => {
   const f = window.__FL__.floorTool;
   f.settings = { ...window.__floorFit };
@@ -1407,30 +1584,58 @@ await page.waitForTimeout(600);
 ok('same-ball click flips Back→Front', /Front/.test(await page.evaluate(() => document.querySelector('.navgizmo-viewlabel').textContent)));
 
 // auto-orthographic: axis view → ortho; rotate away → back to perspective
-ok('axis view auto-switched to ortho', await page.evaluate(() => window.__FL__.editor.isOrtho));
+const autoOrthoState = await page.evaluate(() => ({
+  isOrtho: window.__FL__.editor.isOrtho,
+  mode: window.__FL__.editor.projectionMode,
+}));
+ok('axis view auto-switched to ortho',
+  autoOrthoState.isOrtho && autoOrthoState.mode === 'orthographic', JSON.stringify(autoOrthoState));
 await page.mouse.move(center.x, center.y);
 await page.mouse.down();
 await page.mouse.move(center.x - 30, center.y - 18, { steps: 4 }); // rotate away
 await page.mouse.up();
 await page.waitForTimeout(400);
-ok('rotate away restores perspective', await page.evaluate(() => !window.__FL__.editor.isOrtho));
+const autoRestored = await page.evaluate(() => ({
+  isOrtho: window.__FL__.editor.isOrtho,
+  mode: window.__FL__.editor.projectionMode,
+  label: document.querySelector('.navgizmo-viewlabel').textContent,
+}));
+ok('rotate away restores perspective',
+  !autoRestored.isOrtho && autoRestored.mode === 'perspective' && /Perspective/.test(autoRestored.label),
+  JSON.stringify(autoRestored));
 await page.screenshot({ path: `${ROOT}/.smoke/15-autoortho.png` });
 
-// manual ortho override: user toggles → rotating away keeps their choice
+// Manual projection override: a manual Numpad5 toggle breaks the auto-ortho
+// association. From an auto-ortho axis view it cycles O → I; rotating away
+// leaves the manual orthographic family (I becomes a user orthographic view),
+// it does NOT auto-restore perspective.
+await page.evaluate(() => window.__FL__.editor.setProjectionMode('perspective'));
 await page.evaluate(() => window.__FL__.editor.navGizmo.snapTo('posZ'));
 await page.waitForTimeout(600);
-await page.keyboard.press('Numpad5'); // manual ortho→persp while in axis view
+await page.keyboard.press('Numpad5'); // manual O → I
 await page.waitForTimeout(300);
-ok('manual toggle to persp in axis view', await page.evaluate(() => !window.__FL__.editor.isOrtho));
+const manualIso = await page.evaluate(() => ({
+  mode: window.__FL__.editor.projectionMode,
+  isOrtho: window.__FL__.editor.isOrtho,
+  iso: window.__FL__.editor.isIsometricOrientation(),
+  label: document.querySelector('.navgizmo-viewlabel').textContent,
+}));
+ok('manual toggle in axis view enters isometric',
+  manualIso.mode === 'isometric' && manualIso.isOrtho && manualIso.iso && /Isometric/.test(manualIso.label),
+  JSON.stringify(manualIso));
 await page.mouse.move(center.x, center.y);
 await page.mouse.down();
 await page.mouse.move(center.x + 24, center.y - 14, { steps: 3 });
 await page.mouse.up();
 await page.waitForTimeout(400);
-ok('manual choice survives rotate-away', await page.evaluate(() => !window.__FL__.editor.isOrtho));
-await page.keyboard.press('Numpad5'); // back to ortho for the following checks
-await page.waitForTimeout(200);
-ok('numpad5 back to ortho', await page.evaluate(() => window.__FL__.editor.isOrtho));
+const manualSurvived = await page.evaluate(() => ({
+  mode: window.__FL__.editor.projectionMode,
+  isOrtho: window.__FL__.editor.isOrtho,
+}));
+ok('manual choice survives rotate-away (stays orthographic)',
+  manualSurvived.isOrtho && manualSurvived.mode === 'orthographic',
+  JSON.stringify(manualSurvived));
+await page.evaluate(() => window.__FL__.editor.setProjectionMode('perspective'));
 
 // isolation: a click INSIDE the gizmo canvas must NOT hit the 3D view
 // (no orbit change, no rect-select, no tool action). The gizmo is snapped to
@@ -1498,59 +1703,157 @@ centeredOk = (await checkCentered('User drag')) && centeredOk;
 ok('gizmo stays centered in its own space', centeredOk, JSON.stringify(centerChecks));
 await page.screenshot({ path: `${ROOT}/.smoke/13-nav-centered.png` });
 
-// projection toggle: from an OBLIQUE user view in PERSPECTIVE, toggle to
-// ortho — camera position must be preserved; then back to perspective.
-// (Snap to a ball first would auto-arm ortho, so oblique + persp is the
-// clean starting state for this check.)
+// projection toggle cycle: Perspective → Orthographic → Isometric → Perspective.
+// Start from an OBLIQUE user view in perspective so the P→O position check is clean.
 await page.mouse.move(c.x, c.y);
 await page.mouse.down();
 await page.mouse.move(c.x + 13, c.y - 8, { steps: 2 });
 await page.mouse.up();
 await page.waitForTimeout(300);
-await page.evaluate(() => window.__FL__.editor.navGizmo.toggleProjection()); // ensure persp baseline
-await page.waitForTimeout(200);
-await page.evaluate(() => window.__FL__.editor.navGizmo.toggleProjection()); // now to ortho
-await page.waitForTimeout(300);
+await page.evaluate(() => window.__FL__.editor.setProjectionMode('perspective'));
+await page.waitForTimeout(150);
+
+// P → O: keeps the camera position and orientation
+await page.evaluate(() => window.__FL__.editor.navGizmo.toggleProjection());
+await page.waitForTimeout(250);
 const orthoState = await page.evaluate(() => {
   const ed = window.__FL__.editor;
   return {
+    mode: ed.projectionMode,
     isOrtho: ed.isOrtho,
     posSame: ed.camera.position.distanceTo(ed.perspCamera.position) < 1e-6,
     label: document.querySelector('.navgizmo-viewlabel').textContent,
+    title: ed.navGizmo.btnToggle.title,
   };
 });
-ok('nav toggle to ortho', orthoState.isOrtho && orthoState.posSame, JSON.stringify(orthoState));
+ok('nav toggle to ortho',
+  orthoState.mode === 'orthographic' && orthoState.isOrtho && orthoState.posSame &&
+  /Orthographic/.test(orthoState.label) && /Orthographic/.test(orthoState.title),
+  JSON.stringify(orthoState));
 await page.screenshot({ path: `${ROOT}/.smoke/12-nav-ortho.png` });
 
-// ortho zoom via dolly buttons (zoom property changes, camera position doesn't)
-const zoomBefore = await page.evaluate(() => window.__FL__.editor.camera.zoom);
-await page.evaluate(() => window.__FL__.editor.navGizmo.dolly(1.3));
-const zoomAfter = await page.evaluate(() => ({ z: window.__FL__.editor.camera.zoom, posSame: window.__FL__.editor.camera.position.distanceTo(window.__FL__.editor.perspCamera.position) < 1e-6 }));
-ok('ortho dolly changes zoom', Math.abs(zoomAfter.z - zoomBefore * 1.3) < 1e-6 && zoomAfter.posSame, `zoom ${zoomBefore.toFixed(2)} → ${zoomAfter.z.toFixed(2)}`);
+// ortho dolly changes zoom, not camera position
+const orthoDolly = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  const before = ed.camera.zoom;
+  const posBefore = ed.camera.position.clone();
+  ed.navGizmo.dolly(1.3);
+  return {
+    before,
+    after: ed.camera.zoom,
+    posSame: ed.camera.position.distanceTo(posBefore) < 1e-6,
+    mode: ed.projectionMode,
+  };
+});
+ok('ortho dolly changes zoom',
+  Math.abs(orthoDolly.after - orthoDolly.before * 1.3) < 1e-6 && orthoDolly.posSame &&
+  orthoDolly.mode === 'orthographic',
+  `zoom ${orthoDolly.before.toFixed(2)} → ${orthoDolly.after.toFixed(2)}`);
 
-// back to perspective for the rest
+// O → I: standard isometric orientation, still orthographic
 await page.evaluate(() => window.__FL__.editor.navGizmo.toggleProjection());
-await page.waitForTimeout(200);
-const perspBack = await page.evaluate(() => !window.__FL__.editor.isOrtho);
-ok('nav toggle back to perspective', perspBack);
+await page.waitForTimeout(250);
+const isoState = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  const d = new window.__FL__.THREE.Vector3().subVectors(ed.camera.position, ed.orbit.target).normalize();
+  return {
+    mode: ed.projectionMode,
+    isOrtho: ed.isOrtho,
+    iso: ed.isIsometricOrientation(),
+    dir: d.toArray(),
+    label: document.querySelector('.navgizmo-viewlabel').textContent,
+    title: ed.navGizmo.btnToggle.title,
+  };
+});
+const isoDir = [1 / Math.sqrt(3), 1 / Math.sqrt(3), 1 / Math.sqrt(3)];
+ok('nav toggle to isometric',
+  isoState.mode === 'isometric' && isoState.isOrtho && isoState.iso &&
+  Math.abs(isoState.dir[0] - isoDir[0]) < 1e-3 &&
+  Math.abs(isoState.dir[1] - isoDir[1]) < 1e-3 &&
+  Math.abs(isoState.dir[2] - isoDir[2]) < 1e-3 &&
+  isoState.label === 'Isometric' && /Isometric/.test(isoState.title),
+  JSON.stringify(isoState));
+await page.screenshot({ path: `${ROOT}/.smoke/16-nav-iso.png` });
 
-// numpad shortcuts: Numpad7 = Top, Ctrl+Numpad7 = Bottom, Numpad5 = ortho toggle
+// isometric dolly changes zoom, not position
+const isoDolly = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  const before = ed.camera.zoom;
+  const posBefore = ed.camera.position.clone();
+  ed.navGizmo.dolly(1.3);
+  return {
+    before,
+    after: ed.camera.zoom,
+    posSame: ed.camera.position.distanceTo(posBefore) < 1e-6,
+    mode: ed.projectionMode,
+  };
+});
+ok('isometric dolly changes zoom',
+  Math.abs(isoDolly.after - isoDolly.before * 1.3) < 1e-6 && isoDolly.posSame &&
+  isoDolly.mode === 'isometric',
+  `zoom ${isoDolly.before.toFixed(2)} → ${isoDolly.after.toFixed(2)}`);
+
+// I → P: perspective at the current (isometric) orientation
+await page.evaluate(() => window.__FL__.editor.navGizmo.toggleProjection());
+await page.waitForTimeout(250);
+const perspBack = await page.evaluate(() => ({
+  mode: window.__FL__.editor.projectionMode,
+  isOrtho: window.__FL__.editor.isOrtho,
+  label: document.querySelector('.navgizmo-viewlabel').textContent,
+}));
+ok('nav toggle back to perspective',
+  perspBack.mode === 'perspective' && !perspBack.isOrtho && /Perspective/.test(perspBack.label),
+  JSON.stringify(perspBack));
+
+// numpad shortcuts: Numpad7 = Top, Ctrl+Numpad7 = Bottom, Numpad5 cycles.
+await page.evaluate(() => window.__FL__.editor.setProjectionMode('perspective'));
 await page.keyboard.press('Numpad7');
 await page.waitForTimeout(500);
-const kTop = await page.evaluate(() => document.querySelector('.navgizmo-viewlabel').textContent);
-ok('numpad7 snaps Top', /Top/.test(kTop), kTop);
+const kTop = await page.evaluate(() => ({
+  label: document.querySelector('.navgizmo-viewlabel').textContent,
+  mode: window.__FL__.editor.projectionMode,
+}));
+ok('numpad7 snaps Top (auto-ortho)',
+  /Top/.test(kTop.label) && kTop.mode === 'orthographic', JSON.stringify(kTop));
 await page.keyboard.press('Control+Numpad7');
 await page.waitForTimeout(500);
-const kBottom = await page.evaluate(() => document.querySelector('.navgizmo-viewlabel').textContent);
-ok('ctrl+numpad7 snaps Bottom', /Bottom/.test(kBottom), kBottom);
-// In an axis view auto-ortho is already ON, so Numpad5 now toggles to
-// perspective (manual override) — and back.
+const kBottom = await page.evaluate(() => ({
+  label: document.querySelector('.navgizmo-viewlabel').textContent,
+  mode: window.__FL__.editor.projectionMode,
+}));
+ok('ctrl+numpad7 snaps Bottom',
+  /Bottom/.test(kBottom.label) && kBottom.mode === 'orthographic', JSON.stringify(kBottom));
+
+// From auto-ortho (O), Numpad5 cycles O → I → P → O.
 await page.keyboard.press('Numpad5');
 await page.waitForTimeout(300);
-ok('numpad5 toggles to perspective (manual override)', await page.evaluate(() => !window.__FL__.editor.isOrtho));
+const kIso = await page.evaluate(() => ({
+  mode: window.__FL__.editor.projectionMode,
+  isOrtho: window.__FL__.editor.isOrtho,
+  iso: window.__FL__.editor.isIsometricOrientation(),
+  label: document.querySelector('.navgizmo-viewlabel').textContent,
+}));
+ok('numpad5 cycles ortho → isometric',
+  kIso.mode === 'isometric' && kIso.isOrtho && kIso.iso && kIso.label === 'Isometric',
+  JSON.stringify(kIso));
 await page.keyboard.press('Numpad5');
 await page.waitForTimeout(300);
-ok('numpad5 toggles back to ortho', await page.evaluate(() => window.__FL__.editor.isOrtho));
+const kPersp = await page.evaluate(() => ({
+  mode: window.__FL__.editor.projectionMode,
+  isOrtho: window.__FL__.editor.isOrtho,
+}));
+ok('numpad5 cycles isometric → perspective',
+  kPersp.mode === 'perspective' && !kPersp.isOrtho, JSON.stringify(kPersp));
+await page.keyboard.press('Numpad5');
+await page.waitForTimeout(300);
+const kOrtho = await page.evaluate(() => ({
+  mode: window.__FL__.editor.projectionMode,
+  isOrtho: window.__FL__.editor.isOrtho,
+}));
+ok('numpad5 cycles perspective → orthographic',
+  kOrtho.mode === 'orthographic' && kOrtho.isOrtho, JSON.stringify(kOrtho));
+// leave the app in perspective for the keyboard-shortcut section below
+await page.evaluate(() => window.__FL__.editor.setProjectionMode('perspective'));
 
 // ---- keyboard shortcuts: Q/W/E/R + Tab, acting on the CURRENT object
 // (model via Transform/FFD, floor plane, ref image)
@@ -1781,7 +2084,7 @@ const modelApplyRebind = await page.evaluate(() => {
 ok('Transform panel stays bound after Apply',
   Math.abs(modelApplyRebind.pending - 3) < 1e-6, JSON.stringify(modelApplyRebind));
 
-// Reference image: aspect, world-space size, orientation round-trip and
+// Reference image: aspect, local width/height, billboard orientation, and
 // independent Width/Height edits.
 const refSize = await page.evaluate(async () => {
   const { refTool: r, THREE } = window.__FL__;
@@ -1792,43 +2095,162 @@ const refSize = await page.evaluate(async () => {
   const blob = await new Promise((res) => c.toBlob(res, 'image/png'));
   await r.loadImage(new File([blob], 'wide.png', { type: 'image/png' }));
   window.__FL__.setTool('ref');
-  const plane = r.group.children[0];
-  const world = () => {
-    r.group.updateMatrixWorld(true);
-    const b = new THREE.Box3().setFromObject(plane);
-    return b.getSize(new THREE.Vector3());
-  };
-  const loaded = world();
+  const loaded = r.getSize();
   r.setSize(20, 10);
-  const sized = world();
-  r.setOrientation('vertical');
-  const vertical = r.getSize();
-  r.setOrientation('horizontal');
-  const horizontal = r.getSize();
+  const sized = r.getSize();
   r.setWidth(30);
   const afterWidth = r.getSize();
   r.setHeight(15);
   const afterHeight = r.getSize();
+
+  // Billboard: group quaternion = camera quaternion * Rz(spin).
+  const cam = window.__FL__.editor.camera;
+  const spin = r.state.angleDeg;
+  const rel = cam.quaternion.clone().invert().multiply(r.group.quaternion);
+  const spinQ = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(0, 0, 1), THREE.MathUtils.degToRad(spin));
   return {
-    loaded: [loaded.x, loaded.z],
-    sized: [sized.x, sized.z],
-    vertical: [vertical.w, vertical.h],
-    horizontal: [horizontal.w, horizontal.h],
+    loaded: [loaded.w, loaded.h],
+    sized: [sized.w, sized.h],
     afterWidth: [afterWidth.w, afterWidth.h],
     afterHeight: [afterHeight.w, afterHeight.h],
+    billboardErr: rel.angleTo(spinQ),
+    spin,
+    planeRotX: r.group.children[0].rotation.x,
+    scaleZ: r.group.scale.z,
   };
 });
 ok('ref image preserves its aspect on load',
   Math.abs(refSize.loaded[0] / refSize.loaded[1] - 2) < 0.02, JSON.stringify(refSize.loaded));
-ok('ref setSize is world-space and orientation round-trips',
-  Math.abs(refSize.sized[0] - 20) < 1e-3 && Math.abs(refSize.sized[1] - 10) < 1e-3 &&
-  Math.abs(refSize.vertical[0] - 20) < 1e-3 && Math.abs(refSize.vertical[1] - 10) < 1e-3 &&
-  Math.abs(refSize.horizontal[0] - 20) < 1e-3 && Math.abs(refSize.horizontal[1] - 10) < 1e-3,
-  JSON.stringify({ sized: refSize.sized, vertical: refSize.vertical, horizontal: refSize.horizontal }));
+ok('ref setSize uses local width/height',
+  Math.abs(refSize.sized[0] - 20) < 1e-3 && Math.abs(refSize.sized[1] - 10) < 1e-3,
+  JSON.stringify(refSize.sized));
 ok('ref Width/Height edits are independent',
   Math.abs(refSize.afterWidth[0] - 30) < 1e-3 && Math.abs(refSize.afterWidth[1] - 10) < 1e-3 &&
   Math.abs(refSize.afterHeight[0] - 30) < 1e-3 && Math.abs(refSize.afterHeight[1] - 15) < 1e-3,
   JSON.stringify({ afterWidth: refSize.afterWidth, afterHeight: refSize.afterHeight }));
+ok('ref image billboards to the camera',
+  refSize.billboardErr < 1e-4 && refSize.planeRotX === 0 && Math.abs(refSize.scaleZ - 1) < 1e-6,
+  JSON.stringify({ billboardErr: refSize.billboardErr, spin: refSize.spin, planeRotX: refSize.planeRotX, scaleZ: refSize.scaleZ }));
+
+// 2D spin is applied around the view axis, not world Y/Z.
+const refSpin = await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  r.setAngleDeg(30);
+  const cam = window.__FL__.editor.camera;
+  const rel = cam.quaternion.clone().invert().multiply(r.group.quaternion);
+  const q = new window.__FL__.THREE.Quaternion().setFromAxisAngle(
+    new window.__FL__.THREE.Vector3(0, 0, 1),
+    window.__FL__.THREE.MathUtils.degToRad(30));
+  return { angle: r.state.angleDeg, err: rel.angleTo(q) };
+});
+ok('ref 2D spin is billboard-relative',
+  Math.abs(refSpin.angle - 30) < 1e-6 && refSpin.err < 1e-4, JSON.stringify(refSpin));
+await page.evaluate(() => window.__FL__.refTool.setAngleDeg(0));
+
+// Rotate = local Z only; scale = local X/Y only; translate = world XYZ.
+const refGizmoModes = await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  const g = window.__FL__.editor.gizmo;
+  const read = (mode) => {
+    r.setGizmoMode(mode);
+    return { mode, space: g.space, x: g.showX, y: g.showY, z: g.showZ };
+  };
+  const rotate = read('rotate');
+  const scale = read('scale');
+  const translate = read('translate');
+  return { rotate, scale, translate };
+});
+ok('ref gizmo restricts rotate/scale to 2D',
+  refGizmoModes.rotate.space === 'local' &&
+  !refGizmoModes.rotate.x && !refGizmoModes.rotate.y && refGizmoModes.rotate.z &&
+  refGizmoModes.scale.space === 'local' &&
+  refGizmoModes.scale.x && refGizmoModes.scale.y && !refGizmoModes.scale.z &&
+  refGizmoModes.translate.space === 'world' &&
+  refGizmoModes.translate.x && refGizmoModes.translate.y && refGizmoModes.translate.z,
+  JSON.stringify(refGizmoModes));
+
+// Simulate the local-Z rotate gizmo: the proxy delta folds into the 2D spin.
+const refGizmoRotate = await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  const THREE = window.__FL__.THREE;
+  r.setGizmoMode('rotate');
+  r.setAngleDeg(0);
+  r.onGizmoStart();
+  r.nodeTransform.proxy.quaternion.multiply(
+    new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), THREE.MathUtils.degToRad(25)));
+  r.onGizmoChange();
+  const angle = r.state.angleDeg;
+  r.onGizmoEnd();
+  r.setGizmoMode('translate');
+  r.setAngleDeg(0);
+  return { angle };
+});
+ok('ref rotate gizmo folds local Z into 2D spin',
+  Math.abs(refGizmoRotate.angle - 25) < 1e-4, JSON.stringify(refGizmoRotate));
+
+// Visual: the rotate gizmo shows only the screen-plane Z ring.
+await page.evaluate(() => {
+  window.__FL__.refTool.setGizmoMode('rotate');
+  window.__FL__.buildPanel(); // show the current width/height + Rot active
+});
+await page.waitForTimeout(200);
+await page.screenshot({ path: `${ROOT}/.smoke/20-ref-rotate2d.png` });
+await page.evaluate(() => window.__FL__.refTool.setGizmoMode('translate'));
+
+// In Model mode the image transform is locked (gizmo detached) but the
+// billboard still follows the camera; the topbar Ref toggle is the only control.
+await page.evaluate(() => window.__FL__.setTool('select'));
+await page.waitForTimeout(200);
+const refLockedBefore = await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  return {
+    state: r.state,
+    gizmo: window.__FL__.editor.gizmo.object === r.nodeTransform.proxy,
+  };
+});
+await page.evaluate(() => window.__FL__.editor.navGizmo.snapTo('posX'));
+await page.waitForTimeout(700);
+await page.screenshot({ path: `${ROOT}/.smoke/19-ref-billboard.png` });
+const refLockedAfter = await page.evaluate(() => {
+  const r = window.__FL__.refTool;
+  const cam = window.__FL__.editor.camera;
+  const rel = cam.quaternion.clone().invert().multiply(r.group.quaternion);
+  const spinQ = new window.__FL__.THREE.Quaternion().setFromAxisAngle(
+    new window.__FL__.THREE.Vector3(0, 0, 1),
+    window.__FL__.THREE.MathUtils.degToRad(r.state.angleDeg));
+  return {
+    state: r.state,
+    gizmo: window.__FL__.editor.gizmo.object === r.nodeTransform.proxy,
+    billboardErr: rel.angleTo(spinQ),
+  };
+});
+ok('ref image is locked in Model mode but still faces the camera',
+  !refLockedBefore.gizmo && !refLockedAfter.gizmo &&
+  Math.abs(refLockedBefore.state.x - refLockedAfter.state.x) < 1e-6 &&
+  Math.abs(refLockedBefore.state.y - refLockedAfter.state.y) < 1e-6 &&
+  Math.abs(refLockedBefore.state.z - refLockedAfter.state.z) < 1e-6 &&
+  Math.abs(refLockedBefore.state.w - refLockedAfter.state.w) < 1e-6 &&
+  Math.abs(refLockedBefore.state.h - refLockedAfter.state.h) < 1e-6 &&
+  Math.abs(refLockedBefore.state.angleDeg - refLockedAfter.state.angleDeg) < 1e-6 &&
+  refLockedAfter.billboardErr < 1e-3,
+  JSON.stringify({ before: refLockedBefore, after: refLockedAfter }));
+
+// In Model mode the topbar Ref toggle remains the only image control.
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showref');
+  cb.checked = false;
+  cb.dispatchEvent(new Event('change'));
+});
+const refToggleOff = await page.evaluate(() => window.__FL__.refTool.group.visible);
+await page.evaluate(() => {
+  const cb = document.getElementById('chk-showref');
+  cb.checked = true;
+  cb.dispatchEvent(new Event('change'));
+});
+const refToggleOn = await page.evaluate(() => window.__FL__.refTool.group.visible);
+ok('Ref toggle still works in Model mode', !refToggleOff && refToggleOn,
+  JSON.stringify({ off: refToggleOff, on: refToggleOn }));
 
 // Whole-model export normalization: relative placement must survive.
 const exportNorm = await page.evaluate(async () => {
@@ -2028,6 +2450,139 @@ ok('planar scale uses one shared ratio for both axes',
   JSON.stringify(planarScaleProbe));
 
 await page.screenshot({ path: `${ROOT}/.smoke/09-final.png` });
+
+// ---- 10. i18n: EN | 中文 switch at the top-right
+const langDefault = await page.evaluate(() => {
+  const sw = document.getElementById('lang-switch');
+  const r = sw.getBoundingClientRect();
+  return {
+    exists: !!sw,
+    buttons: [...sw.querySelectorAll('button')].map((b) => b.textContent),
+    active: sw.querySelector('button.active') ? sw.querySelector('button.active').dataset.lang : null,
+    lang: window.__FL__.getLanguage(),
+    htmlLang: document.documentElement.lang,
+    title: document.title,
+    right: r.right,
+    top: r.top,
+    innerWidth: window.innerWidth,
+  };
+});
+ok('language switch exists at the top-right, default EN',
+  langDefault.exists && langDefault.buttons.join('|') === 'EN|中文' &&
+  langDefault.active === 'en' && langDefault.lang === 'en' &&
+  langDefault.htmlLang === 'en' && langDefault.title === 'Floor Leveling Editor' &&
+  langDefault.right > langDefault.innerWidth - 120 && langDefault.top < 45,
+  JSON.stringify(langDefault));
+
+await page.click('#lang-switch button[data-lang="zh"]');
+await page.waitForTimeout(350);
+const zh = await page.evaluate(() => {
+  const labels = [];
+  window.__FL__.editor.helperGroup.traverse((o) => {
+    if (o.userData && o.userData.isLabel) labels.push(o.userData.labelText);
+  });
+  const ffdButtons = [...document.querySelectorAll('#panel-body button')].map((b) => b.textContent);
+  return {
+    lang: window.__FL__.getLanguage(),
+    active: document.querySelector('#lang-switch button.active') ? document.querySelector('#lang-switch button.active').dataset.lang : null,
+    htmlLang: document.documentElement.lang,
+    title: document.title,
+    importText: document.getElementById('btn-import').textContent,
+    modelText: document.getElementById('tool-model').textContent,
+    floorLabelText: document.querySelector('[data-i18n="topbar.floor"]').textContent,
+    labelText: document.querySelector('[data-i18n="topbar.label"]').textContent,
+    panelTitle: document.getElementById('panel-title').textContent,
+    subTabs: [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent),
+    groupTitles: [...document.querySelectorAll('#panel-body .gtitle')].map((b) => b.textContent),
+    ffdButtons,
+    status: document.getElementById('status').textContent,
+    navLabel: document.querySelector('.navgizmo-viewlabel').textContent,
+    floorTag: window.__FL__.floorTool.floorLabelText,
+    axisLabels: labels.filter((x) => x === 'X（米）' || x === 'Z（米）'),
+    stored: localStorage.getItem('floor-leveling.lang'),
+  };
+});
+ok('Chinese switch translates topbar, toolbar, panel, status, nav + 3D labels',
+  zh.lang === 'zh' && zh.active === 'zh' && zh.htmlLang === 'zh-CN' &&
+  zh.title === '地面找平编辑器' &&
+  zh.importText === '导入…' && zh.modelText === '模型' &&
+  zh.floorLabelText === '地面' && zh.labelText === '标签' &&
+  zh.panelTitle === '自由变形（FFD）' &&
+  zh.subTabs.join('|') === '信息|变换|FFD' &&
+  zh.groupTitles.includes('晶格') && zh.groupTitles.includes('选择') &&
+  zh.ffdButtons.includes('重置') && zh.ffdButtons.includes('塌陷') &&
+  zh.status.includes('个三角形') &&
+  (zh.navLabel.includes('视图') || zh.navLabel === '等轴测') &&
+  zh.floorTag === '地面' && zh.axisLabels.length === 2 &&
+  zh.stored === 'zh',
+  JSON.stringify(zh));
+
+// The new projection UI is translated too; leave the app in isometric for
+// the Chinese screenshot below.
+const zhIso = await page.evaluate(() => {
+  const ed = window.__FL__.editor;
+  // Reframe first: the projection tests above leave the camera zoomed in.
+  ed.setProjectionMode('perspective');
+  ed.frameModel();
+  ed.setProjectionMode('isometric');
+  return {
+    mode: ed.projectionMode,
+    label: document.querySelector('.navgizmo-viewlabel').textContent,
+    title: ed.navGizmo.btnToggle.title,
+  };
+});
+ok('Chinese isometric label + toggle title',
+  zhIso.mode === 'isometric' && zhIso.label === '等轴测' && zhIso.title.includes('等轴测'),
+  JSON.stringify(zhIso));
+
+const transformTitles = await page.evaluate(() => {
+  const FL = window.__FL__;
+  const read = (tool, idx) => {
+    FL.setTool(tool);
+    const tabs = document.querySelectorAll('#subtabs button');
+    tabs[idx].click();
+    return document.getElementById('panel-title').textContent;
+  };
+  const floor = read('floor', 2);
+  const ref = read('ref', 1);
+  FL.setTool('ffd'); // restore the FFD panel for the screenshot
+  return { floor, ref };
+});
+ok('Floor/Ref Transform panel titles are translated',
+  transformTitles.floor === '地面' && transformTitles.ref === '参考图像',
+  JSON.stringify(transformTitles));
+
+await page.screenshot({ path: `${ROOT}/.smoke/21-chinese-ui.png` });
+
+await page.click('#lang-switch button[data-lang="en"]');
+await page.waitForTimeout(350);
+const en = await page.evaluate(() => {
+  const labels = [];
+  window.__FL__.editor.helperGroup.traverse((o) => {
+    if (o.userData && o.userData.isLabel) labels.push(o.userData.labelText);
+  });
+  return {
+    lang: window.__FL__.getLanguage(),
+    active: document.querySelector('#lang-switch button.active') ? document.querySelector('#lang-switch button.active').dataset.lang : null,
+    htmlLang: document.documentElement.lang,
+    title: document.title,
+    importText: document.getElementById('btn-import').textContent,
+    panelTitle: document.getElementById('panel-title').textContent,
+    subTabs: [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent),
+    navLabel: document.querySelector('.navgizmo-viewlabel').textContent,
+    floorTag: window.__FL__.floorTool.floorLabelText,
+    hasAxisM: labels.includes('X (m)') && labels.includes('Z (m)'),
+    stored: localStorage.getItem('floor-leveling.lang'),
+  };
+});
+ok('switching back to EN restores English UI + 3D labels',
+  en.lang === 'en' && en.active === 'en' && en.htmlLang === 'en' &&
+  en.title === 'Floor Leveling Editor' && en.importText === 'Import…' &&
+  en.panelTitle === 'Free-Form Deformation (FFD)' &&
+  en.subTabs.join('|') === 'Info|Transform|FFD' &&
+  (en.navLabel.includes('Perspective') || en.navLabel.includes('Orthographic') || en.navLabel.includes('Isometric')) &&
+  en.floorTag === 'floor' && en.hasAxisM && en.stored === 'en',
+  JSON.stringify(en));
 
 writeFileSync(`${ROOT}/.smoke/results.json`, JSON.stringify(results, null, 2));
 const failed = results.filter((r) => !r.pass);

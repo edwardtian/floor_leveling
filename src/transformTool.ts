@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import type { Editor } from './editor';
 import type { MeshData, PendingTransform } from './types';
 import { DEFAULT_TRANSFORM, geometryCenter, planarScaleRatios } from './transform';
+import { t } from './i18n';
 import type { History } from './history';
 
 /**
@@ -231,7 +232,7 @@ export class TransformTool {
     const pendingBefore = { ...this.pending };
 
     this.history.push({
-      name: 'Apply transform',
+      name: t('history.applyTransform'),
       undo: () => {
         (pos.array as Float32Array).set(beforePos);
         if (nor && beforeNor) (nor.array as Float32Array).set(beforeNor);

@@ -1,9 +1,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { TransformControls } from 'three/examples/jsm/controls/TransformControls.js';
-import type { MeasurementUnits } from './types';
+import type { MeasurementUnits, ProjectionMode } from './types';
 import { METER_TO_UNIT } from './units';
+import { t } from './i18n';
 import { NavigationGizmo } from './navGizmo';
+
+/** Standard isometric eye direction (45° azimuth, ~35.264° elevation). */
+const ISOMETRIC_DIR = new THREE.Vector3(1, 1, 1).normalize();
 
 /**
  * The three.js core: renderer, camera, orbit, gizmo, grid ruler with meter
@@ -14,16 +18,22 @@ export class Editor {
   dom: HTMLElement;
   renderer: THREE.WebGLRenderer;
   scene: THREE.Scene;
-  /** Active camera (perspective or orthographic — swapped by toggleProjection). */
+  /** Active camera (perspective or orthographic — swapped by setProjectionMode). */
   camera: THREE.PerspectiveCamera | THREE.OrthographicCamera;
   perspCamera: THREE.PerspectiveCamera;
   orthoCamera: THREE.OrthographicCamera;
+  /** Current projection mode; isometric uses the ortho camera at a fixed angle. */
+  projectionMode: ProjectionMode = 'perspective';
   orbit: OrbitControls;
   navGizmo: NavigationGizmo;
 
   modelRoot = new THREE.Group();
   overlayGroup = new THREE.Group();
   helperGroup = new THREE.Group();
+
+  /** 3D text labels (grid ruler numbers/captions, floor tag) on/off. */
+  private labelsVisible = true;
+  private labelsVisibilityListeners: ((v: boolean) => void)[] = [];
 
   gizmo: TransformControls;
   gizmoHelper: THREE.Object3D;
@@ -186,48 +196,100 @@ export class Editor {
     return this.camera instanceof THREE.OrthographicCamera;
   }
 
-  /** Blender-style Numpad-5: swap perspective/orthographic, keeping the view. */
-  toggleProjection(): void {
-    const target = this.orbit.target;
-    const dist = Math.max(this.orbit.getDistance(), 0.001);
-    const aspect = this.dom.clientWidth / Math.max(this.dom.clientHeight, 1);
+  get isIsometric(): boolean {
+    return this.projectionMode === 'isometric';
+  }
 
-    if (this.camera instanceof THREE.PerspectiveCamera) {
-      const persp = this.camera as THREE.PerspectiveCamera;
-      // Match framing: ortho frustum height ≈ visible height at target distance.
-      const halfH = dist * Math.tan(THREE.MathUtils.degToRad(persp.fov / 2));
-      const oc = this.orthoCamera;
-      oc.position.copy(persp.position);
-      oc.quaternion.copy(persp.quaternion);
-      oc.up.copy(persp.up);
-      oc.top = halfH;
-      oc.bottom = -halfH;
-      oc.left = -halfH * aspect;
-      oc.right = halfH * aspect;
-      oc.near = 0.01;
-      oc.far = Math.max(dist * 40, 500);
-      oc.zoom = 1;
-      oc.updateProjectionMatrix();
-      this.camera = oc;
-    } else {
-      const oc = this.orthoCamera;
-      const persp = this.perspCamera;
-      persp.position.copy(oc.position);
-      persp.quaternion.copy(oc.quaternion);
-      persp.up.copy(oc.up);
-      // Match framing: distance so the visible height equals the ortho frustum.
-      const halfH = (oc.top - oc.bottom) / 2 / Math.max(oc.zoom, 1e-6);
-      const d = halfH / Math.tan(THREE.MathUtils.degToRad(persp.fov / 2));
-      persp.position.copy(target).addScaledVector(new THREE.Vector3(0, 0, 1).applyQuaternion(oc.quaternion), d);
-      persp.near = Math.max(d / 100, 0.001);
-      persp.far = d * 40;
-      persp.updateProjectionMatrix();
-      this.camera = persp;
+  /** True when the camera sits on the standard isometric axis from the target. */
+  isIsometricOrientation(eps = 1e-3): boolean {
+    const dir = new THREE.Vector3().subVectors(this.camera.position, this.orbit.target);
+    if (dir.lengthSq() < 1e-12) return false;
+    return dir.normalize().distanceTo(ISOMETRIC_DIR) < eps;
+  }
+
+  /**
+   * Set the projection mode explicitly:
+   *  - perspective ↔ orthographic keeps the current view orientation;
+   *  - isometric is an orthographic camera at the standard isometric angle.
+   * The nav gizmo's auto-ortho and the tests use this to jump to a known mode.
+   */
+  setProjectionMode(mode: ProjectionMode): void {
+    if (mode === this.projectionMode && mode !== 'isometric') {
+      this.navGizmo?.refreshProjectionUi();
+      return;
     }
+    this.projectionMode = mode;
+
+    if (mode === 'perspective') {
+      if (this.camera instanceof THREE.OrthographicCamera) this.swapToPerspective();
+    } else {
+      if (this.camera instanceof THREE.PerspectiveCamera) this.swapToOrthographic();
+      if (mode === 'isometric') this.applyIsometricOrientation();
+    }
+
     this.orbit.object = this.camera;
     this.orbit.update();
     (this.gizmo as any).camera = this.camera;
     this.frameRadius = this.computeFrameRadius();
+    this.navGizmo?.refreshProjectionUi();
+  }
+
+  /** Numpad-5 / nav button: cycle perspective → orthographic → isometric. */
+  toggleProjection(): void {
+    const next: ProjectionMode =
+      this.projectionMode === 'perspective' ? 'orthographic' :
+      this.projectionMode === 'orthographic' ? 'isometric' : 'perspective';
+    this.setProjectionMode(next);
+  }
+
+  /** Perspective → orthographic, keeping the exact view orientation. */
+  private swapToOrthographic(): void {
+    const persp = this.perspCamera;
+    const oc = this.orthoCamera;
+    const dist = Math.max(this.orbit.getDistance(), 0.001);
+    const aspect = this.dom.clientWidth / Math.max(this.dom.clientHeight, 1);
+    // Match framing: ortho frustum height ≈ visible height at target distance.
+    const halfH = dist * Math.tan(THREE.MathUtils.degToRad(persp.fov / 2));
+    oc.position.copy(persp.position);
+    oc.quaternion.copy(persp.quaternion);
+    oc.up.copy(persp.up);
+    oc.top = halfH;
+    oc.bottom = -halfH;
+    oc.left = -halfH * aspect;
+    oc.right = halfH * aspect;
+    oc.near = 0.01;
+    oc.far = Math.max(dist * 40, 500);
+    oc.zoom = 1;
+    oc.updateProjectionMatrix();
+    this.camera = oc;
+  }
+
+  /** Orthographic → perspective, keeping the exact view orientation. */
+  private swapToPerspective(): void {
+    const oc = this.orthoCamera;
+    const persp = this.perspCamera;
+    const target = this.orbit.target;
+    persp.position.copy(oc.position);
+    persp.quaternion.copy(oc.quaternion);
+    persp.up.copy(oc.up);
+    // Match framing: distance so the visible height equals the ortho frustum.
+    const halfH = (oc.top - oc.bottom) / 2 / Math.max(oc.zoom, 1e-6);
+    const d = halfH / Math.tan(THREE.MathUtils.degToRad(persp.fov / 2));
+    persp.position.copy(target).addScaledVector(new THREE.Vector3(0, 0, 1).applyQuaternion(oc.quaternion), d);
+    persp.near = Math.max(d / 100, 0.001);
+    persp.far = d * 40;
+    persp.updateProjectionMatrix();
+    this.camera = persp;
+  }
+
+  /** Point the orthographic camera at the target from the isometric axis. */
+  private applyIsometricOrientation(): void {
+    const target = this.orbit.target;
+    const dist = Math.max(this.camera.position.distanceTo(target), 0.001);
+    this.camera.position.copy(target).addScaledVector(ISOMETRIC_DIR, dist);
+    this.camera.up.set(0, 1, 0);
+    this.camera.lookAt(target);
+    this.camera.updateMatrixWorld();
   }
 
   /** Zoom in (>1) / out (<1) — Blender-style dolly about the orbit target. */
@@ -280,7 +342,9 @@ export class Editor {
     const size = box.getSize(new THREE.Vector3());
     const maxDim = Math.max(size.x, size.y, size.z, 0.001);
     const aspect = this.dom.clientWidth / Math.max(this.dom.clientHeight, 1);
-    const dir = new THREE.Vector3(1, 0.65, 1).normalize();
+    const dir = this.projectionMode === 'isometric'
+      ? ISOMETRIC_DIR.clone()
+      : new THREE.Vector3(1, 0.65, 1).normalize();
 
     if (this.camera instanceof THREE.PerspectiveCamera) {
       const dist = (maxDim / 2) / Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * 1.7;
@@ -313,14 +377,64 @@ export class Editor {
 
   setGridVisible(v: boolean): void {
     this.gridVisible = v;
-    this.helperGroup.visible = v;
+    this.helperGroup.visible = v; // gates grid lines AND their labels
+  }
+
+  /** Whether the 3D text labels (grid ruler, floor tag) are shown. */
+  get isLabelsVisible(): boolean {
+    return this.labelsVisible;
+  }
+
+  /**
+   * Show/hide all 3D text labels — grid distance numbers, the X/Z unit
+   * captions and the floor tag — without touching grid lines or axes. The
+   * Grid toggle still gates the grid labels through helperGroup visibility,
+   * so with Grid off everything grid-related disappears regardless.
+   */
+  setLabelsVisible(v: boolean): void {
+    this.labelsVisible = v;
+    this.applyGridLabelVisibility();
+    for (const fn of this.labelsVisibilityListeners) fn(v);
+  }
+
+  /** Subscribe to Label toggle changes (overlay labels like the floor tag). */
+  addLabelsVisibilityListener(fn: (v: boolean) => void): void {
+    this.labelsVisibilityListeners.push(fn);
+  }
+
+  private applyGridLabelVisibility(): void {
+    this.helperGroup.traverse((o) => {
+      if (o.userData.isLabel) o.visible = this.labelsVisible;
+    });
+  }
+
+  /** Dispose a removed grid helper (geometry, material and label texture). */
+  private disposeHelper(root: THREE.Object3D): void {
+    root.traverse((child) => {
+      const mesh = child as THREE.Mesh;
+      if (mesh.geometry) mesh.geometry.dispose();
+      const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
+      if (Array.isArray(mat)) {
+        for (const m of mat) this.disposeMaterial(m);
+      } else if (mat) {
+        this.disposeMaterial(mat);
+      }
+    });
+  }
+
+  private disposeMaterial(m: THREE.Material): void {
+    const map = (m as THREE.MeshBasicMaterial).map;
+    map?.dispose();
+    m.dispose();
   }
 
   rebuildGrid(): void {
-    // Remove old helpers (keep group object).
+    // Remove old helpers (keep group object) and dispose their GPU resources
+    // (label sprites own a canvas texture each; language switches rebuild).
     while (this.helperGroup.children.length) {
       const c = this.helperGroup.children.pop()!;
       this.helperGroup.remove(c);
+      this.disposeHelper(c);
     }
     const box = new THREE.Box3().setFromObject(this.modelRoot);
     let size = 10;
@@ -349,7 +463,7 @@ export class Editor {
 
     // Meter labels along +X and +Z, plus axis captions (R7: units readable).
     const u = METER_TO_UNIT[this.units];
-    const suffix = this.units === 'meter' ? 'm' : 'cm';
+    const unit = t(this.units === 'meter' ? 'unit.m' : 'unit.cm');
     const half = size / 2;
     for (let i = 1; i <= half; i++) {
       const vMeters = i;
@@ -357,8 +471,9 @@ export class Editor {
       this.helperGroup.add(makeTextSprite(label, 0x8a919b, new THREE.Vector3(vMeters, 0.003, 0.03), 0.16));
       this.helperGroup.add(makeTextSprite(label, 0x8a919b, new THREE.Vector3(0.03, 0.003, vMeters), 0.16));
     }
-    this.helperGroup.add(makeTextSprite(`X (${suffix})`, 0xc76a6a, new THREE.Vector3(half + 0.45, 0.003, 0), 0.2));
-    this.helperGroup.add(makeTextSprite(`Z (${suffix})`, 0x6a7fc7, new THREE.Vector3(0, 0.003, half + 0.45), 0.2));
+    this.helperGroup.add(makeTextSprite(t('scene.axisCaption', { axis: 'X', unit }), 0xc76a6a, new THREE.Vector3(half + 0.45, 0.003, 0), 0.2));
+    this.helperGroup.add(makeTextSprite(t('scene.axisCaption', { axis: 'Z', unit }), 0x6a7fc7, new THREE.Vector3(0, 0.003, half + 0.45), 0.2));
+    this.applyGridLabelVisibility();
     this.helperGroup.visible = this.gridVisible;
   }
 
@@ -547,5 +662,8 @@ export function makeTextSprite(text: string, color: number, pos: THREE.Vector3, 
   sprite.scale.set(height * aspect, height, 1);
   sprite.position.copy(pos);
   sprite.renderOrder = 5;
+  // Tag 3D text so the topbar Label toggle can find and hide it.
+  sprite.userData.isLabel = true;
+  sprite.userData.labelText = text;
   return sprite;
 }

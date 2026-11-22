@@ -6,6 +6,7 @@ import { selectionFalloff, weldedVertexWeights, getAdjacency } from './falloff';
 import { applyBrushDab, collectBrushHits, type BrushDabResult } from './brush';
 import { makeTextSprite } from './editor';
 import { PendingNodeTransform } from './objectTransform';
+import { t } from './i18n';
 import type { History } from './history';
 
 /**
@@ -84,6 +85,49 @@ export class FloorTool {
   get planeVisuals(): { plane: THREE.Mesh; outline: THREE.LineSegments } {
     return { plane: this.planeMesh, outline: this.outline };
   }
+
+  /** Whether the "floor" tag is currently shown (tests / topbar sync). */
+  get floorLabelVisible(): boolean {
+    return this.floorLabel.visible;
+  }
+
+  /** Current floor tag text ("floor" / "地面"). */
+  get floorLabelText(): string {
+    return (this.floorLabel.userData.labelText as string) ?? '';
+  }
+
+  /** The floor tag follows the tool/plane visibility and the Label toggle. */
+  refreshLabelVisibility(): void {
+    this.floorLabel.visible = this.active && this.uiVisible && this.editor.isLabelsVisible;
+  }
+
+  /**
+   * Apply the global Floor toggle to the plane and outline. This is
+   * deliberately independent of `active`: the floor can be shown as a
+   * reference in Model/Ref mode, and the topbar checkbox stays meaningful.
+   */
+  applyVisibility(): void {
+    const show = this.uiVisible;
+    this.floorRoot.visible = show;
+    this.planeMesh.visible = show;
+    this.outline.visible = show;
+    this.refreshLabelVisibility();
+  }
+
+  /** Recreate the "floor"/"地面" tag after a language switch. */
+  rebuildFloorLabel(): void {
+    const old = this.floorLabel;
+    this.editor.overlayGroup.remove(old);
+    const mat = old.material as THREE.SpriteMaterial;
+    mat.map?.dispose();
+    mat.dispose();
+    this.floorLabel = makeTextSprite(t('scene.floor'), 0x2fb9b9, new THREE.Vector3(0, 0, 0), 0.22);
+    this.floorLabel.renderOrder = 6;
+    this.editor.overlayGroup.add(this.floorLabel);
+    this.positionLabel();
+    this.refreshLabelVisibility();
+  }
+
   private hitMesh: THREE.Mesh | null = null;
   private hitGeo: THREE.BufferGeometry | null = null;
   private hitColor: THREE.BufferAttribute | null = null;
@@ -147,9 +191,13 @@ export class FloorTool {
     this.outline.raycast = () => {};
     this.floorRoot.add(this.outline);
 
-    this.floorLabel = makeTextSprite('floor', 0x2fb9b9, new THREE.Vector3(0, 0, 0), 0.22);
+    this.floorLabel = makeTextSprite(t('scene.floor'), 0x2fb9b9, new THREE.Vector3(0, 0, 0), 0.22);
     this.floorLabel.renderOrder = 6;
+    this.floorLabel.visible = false; // the floor tool starts inactive
     this.editor.overlayGroup.add(this.floorLabel);
+    // The floor tag lives in the overlay group (not the grid's helper group),
+    // so it follows the Label toggle through this listener.
+    this.editor.addLabelsVisibilityListener(() => this.refreshLabelVisibility());
 
     // Brush cursor: outer/inner rings + translucent disc, lying on the plane.
     this.brushCursor = new THREE.Group();
@@ -228,10 +276,7 @@ export class FloorTool {
   setActive(v: boolean): void {
     const was = this.active;
     this.active = v;
-    this.planeMesh.visible = v && this.uiVisible;
-    this.outline.visible = v && this.uiVisible;
-    this.floorRoot.visible = v;
-    this.floorLabel.visible = this.planeMesh.visible;
+    this.applyVisibility();
     if (!v) {
       this.endBrushStroke();
       this.brushMode = false;
@@ -251,9 +296,7 @@ export class FloorTool {
       // user's placement persists until they change it or import anew.
       // If a pending transform is armed, keep the flag set: fitting now would
       // silently do nothing (or would have to discard the pending edit).
-      if (this.autoFitPending && this.fitToModel()) {
-        this.autoFitPending = false;
-      }
+      this.fitIfPending();
       this.nodeTransform.attachGizmo(this.gizmoMode);
       // All scale axes stay visible: hiding Y would also hide the XYZ center
       // cube, i.e. the only uniform-scale handle.
@@ -466,6 +509,11 @@ export class FloorTool {
     this.settings.cz = center.z;
     this.updatePlane();
     return true;
+  }
+
+  /** Run the one-time auto-fit if it is still pending (import / first show). */
+  fitIfPending(): void {
+    if (this.autoFitPending && this.fitToModel()) this.autoFitPending = false;
   }
 
   /**
@@ -854,7 +902,7 @@ export class FloorTool {
         mesh.geometry.computeBoundingSphere();
       };
       this.history.push({
-        name: 'Brush: push/pull to floor',
+        name: t('history.brush'),
         undo: () => restore(before),
         redo: () => restore(after),
       });
@@ -1084,7 +1132,7 @@ export class FloorTool {
       mesh.geometry.computeBoundingBox();
       mesh.geometry.computeBoundingSphere();
     };
-    this.history.push({ name: mode === 'drop' ? 'Level: drop to floor' : 'Level: flatten to floor', undo, redo });
+    this.history.push({ name: mode === 'drop' ? t('history.levelDrop') : t('history.levelFlatten'), undo, redo });
 
     // Re-scan so highlights reflect the new geometry.
     this.scan();

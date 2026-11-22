@@ -3,6 +3,9 @@ import * as THREE from 'three';
 /** Units for display; scene space is always meters (1 unit = 1 m). */
 export type MeasurementUnits = 'meter' | 'centimeter';
 
+/** Camera projection: isometric is an orthographic camera at a fixed angle. */
+export type ProjectionMode = 'perspective' | 'orthographic' | 'isometric';
+
 /** A tool identifier. */
 export type ToolId = 'select' | 'transform' | 'ffd' | 'floor' | 'ref';
 

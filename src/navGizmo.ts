@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
+import type { ProjectionMode } from './types';
+import { t, type TranslationKey } from './i18n';
 
 /**
  * Blender-style navigation gizmo in its OWN overlay space:
@@ -11,8 +13,8 @@ import type { Editor } from './editor';
  *  - 6 axis balls (+X/Y/Z solid, −X/Y/Z hollow rings). Click snaps to that
  *    view (Right/Left/Top/Bottom/Front/Back) with a short smooth turn.
  *  - Drag on the gizmo = orbit (trackball).
- *  - Zoom in/out + perspective/orthographic toggle (Blender's vertical stack).
- *  - Numpad keys: 1/3/7 (+Ctrl = opposite), 5 = ortho, +/- = zoom.
+ *  - Zoom in/out + projection toggle (Perspective → Orthographic → Isometric).
+ *  - Numpad keys: 1/3/7 (+Ctrl = opposite), 5 = cycle projection, +/- = zoom.
  *  - Caption below shows the current view + projection.
  *
  * Y-up convention: +Y is Top, −Z is the side the default camera sits on, so
@@ -20,7 +22,7 @@ import type { Editor } from './editor';
  */
 interface AxisBall {
   key: string;
-  name: string;
+  nameKey: TranslationKey;
   dir: THREE.Vector3;
   mesh: THREE.Mesh;
   torus?: THREE.Mesh;
@@ -63,12 +65,16 @@ export class NavigationGizmo {
     dur: number;
     dist: number;
     target: THREE.Vector3;
-    label: string;
+    viewKey: TranslationKey;
   } | null = null;
 
   private tooltip!: HTMLDivElement;
   private viewLabel!: HTMLDivElement;
   private btnToggle!: HTMLButtonElement;
+  private btnZoomIn!: HTMLButtonElement;
+  private btnZoomOut!: HTMLButtonElement;
+  /** Last axis view (for the caption); null = free user view. */
+  private currentViewKey: TranslationKey | null = null;
 
   /** True while an axis view auto-switched the projection to orthographic. */
   private autoOrtho = false;
@@ -158,14 +164,14 @@ export class NavigationGizmo {
 
   private buildGizmo(): void {
     const defs = [
-      { key: 'posX', name: 'Right', dir: new THREE.Vector3(1, 0, 0), axis: 'x' as const, sign: 1 },
-      { key: 'negX', name: 'Left', dir: new THREE.Vector3(-1, 0, 0), axis: 'x' as const, sign: -1 },
-      { key: 'posY', name: 'Top', dir: new THREE.Vector3(0, 1, 0), axis: 'y' as const, sign: 1 },
-      { key: 'negY', name: 'Bottom', dir: new THREE.Vector3(0, -1, 0), axis: 'y' as const, sign: -1 },
+      { key: 'posX', nameKey: 'nav.right' as const, dir: new THREE.Vector3(1, 0, 0), axis: 'x' as const, sign: 1 },
+      { key: 'negX', nameKey: 'nav.left' as const, dir: new THREE.Vector3(-1, 0, 0), axis: 'x' as const, sign: -1 },
+      { key: 'posY', nameKey: 'nav.top' as const, dir: new THREE.Vector3(0, 1, 0), axis: 'y' as const, sign: 1 },
+      { key: 'negY', nameKey: 'nav.bottom' as const, dir: new THREE.Vector3(0, -1, 0), axis: 'y' as const, sign: -1 },
       // Y-up app: the default camera sits on the +Z side looking −Z, so that
       // side is "Front" (Blender's −Y ball = Front, mapped to this app's +Z).
-      { key: 'posZ', name: 'Front', dir: new THREE.Vector3(0, 0, 1), axis: 'z' as const, sign: 1 },
-      { key: 'negZ', name: 'Back', dir: new THREE.Vector3(0, 0, -1), axis: 'z' as const, sign: -1 },
+      { key: 'posZ', nameKey: 'nav.front' as const, dir: new THREE.Vector3(0, 0, 1), axis: 'z' as const, sign: 1 },
+      { key: 'negZ', nameKey: 'nav.back' as const, dir: new THREE.Vector3(0, 0, -1), axis: 'z' as const, sign: -1 },
     ];
 
     for (const d of defs) {
@@ -203,15 +209,15 @@ export class NavigationGizmo {
         );
       }
       pick.position.copy(d.dir).multiplyScalar(BALL_R);
-      pick.userData = { key: d.key, name: d.name };
+      pick.userData = { key: d.key };
       if (d.sign > 0) this.pickDisks.push(pick);
       else this.pickRings.push(pick);
       this.scene.add(pick);
       mesh.position.copy(d.dir).multiplyScalar(BALL_R);
       mesh.renderOrder = 2;
-      mesh.userData = { key: d.key, name: d.name };
+      mesh.userData = { key: d.key };
       this.scene.add(mesh);
-      this.balls.push({ key: d.key, name: d.name, dir: d.dir, mesh, torus, pick });
+      this.balls.push({ key: d.key, nameKey: d.nameKey, dir: d.dir, mesh, torus, pick });
     }
 
     // Axis spokes: center → each ball (positive bright, negative dim).
@@ -268,15 +274,15 @@ export class NavigationGizmo {
       row.appendChild(b);
       return b;
     };
-    mkBtn(ICON_ZOOM_IN, 'Zoom in', () => this.editor.dollyBy(1.3));
-    mkBtn(ICON_ZOOM_OUT, 'Zoom out', () => this.editor.dollyBy(1 / 1.3));
-    this.btnToggle = mkBtn(ICON_PERSP, 'Toggle perspective/orthographic (currently Perspective)', () =>
+    this.btnZoomIn = mkBtn(ICON_ZOOM_IN, t('nav.zoomIn'), () => this.editor.dollyBy(1.3));
+    this.btnZoomOut = mkBtn(ICON_ZOOM_OUT, t('nav.zoomOut'), () => this.editor.dollyBy(1 / 1.3));
+    this.btnToggle = mkBtn(ICON_PERSP, t('nav.toggleProjection', { mode: this.projectionLabel('perspective') }), () =>
       this.toggleProjection(),
     );
 
     const label = document.createElement('div');
     label.className = 'navgizmo-viewlabel';
-    label.textContent = 'User Perspective';
+    label.textContent = this.viewLabelFor(null, this.editor.projectionMode);
     container.appendChild(label);
     this.viewLabel = label;
 
@@ -284,6 +290,7 @@ export class NavigationGizmo {
     tooltip.className = 'navgizmo-tooltip hidden';
     container.appendChild(tooltip);
     this.tooltip = tooltip;
+    this.updateToggleButton();
   }
 
   // ---------- pointer handling ----------
@@ -320,7 +327,7 @@ export class NavigationGizmo {
     if (this.drag.moved < 2) return;
 
     this.orbitByPixels(dx, dy);
-    this.setViewLabel(`User ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'}`);
+    this.markUser();
   };
 
   private onPointerUp = (): void => {
@@ -358,8 +365,8 @@ export class NavigationGizmo {
       this.hoverKey = key;
       if (key) {
         this.setBallHover(key, true);
-        const name = this.balls.find((b) => b.key === key)!.name;
-        this.tooltip.textContent = name;
+        const ball = this.balls.find((b) => b.key === key)!;
+        this.tooltip.textContent = t(ball.nameKey);
         this.tooltip.classList.remove('hidden');
       } else {
         this.hideTooltip();
@@ -444,6 +451,7 @@ export class NavigationGizmo {
     // Blender: landing on an exact axis view switches to orthographic;
     // rotating away restores the projection the user had before.
     this.armAutoOrtho();
+    this.currentViewKey = ball.nameKey;
     this.tween = {
       from: cam.quaternion.clone(),
       to,
@@ -452,7 +460,7 @@ export class NavigationGizmo {
       dur: 0.28,
       dist,
       target,
-      label: `${ball.name} ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'}`,
+      viewKey: ball.nameKey,
     };
     this.editor.orbit.enabled = false;
   }
@@ -460,15 +468,17 @@ export class NavigationGizmo {
   /**
    * Entering an axis view: if currently perspective, switch to orthographic
    * (remembering the user's projection so it can be restored). If already
-   * orthographic (user-set or a previous auto switch), keep it.
+   * orthographic — including isometric — keep the ortho camera and leave
+   * isometric mode (an axis view is not the isometric view).
    */
   private armAutoOrtho(): void {
     if (!this.autoOrtho) {
-      if (!this.editor.isOrtho) {
+      if (this.editor.projectionMode === 'perspective') {
         this.projectionBeforeAutoOrtho = 'persp';
-        this.setProjection(true);
+        this.setProjectionMode('orthographic');
       } else {
         this.projectionBeforeAutoOrtho = 'ortho';
+        if (this.editor.projectionMode === 'isometric') this.setProjectionMode('orthographic');
       }
     }
     this.autoOrtho = true;
@@ -480,23 +490,41 @@ export class NavigationGizmo {
    */
   private disarmAutoOrtho(): void {
     if (this.autoOrtho && this.projectionBeforeAutoOrtho === 'persp') {
-      this.setProjection(false);
-      if (!this.tween) this.setViewLabel(`User ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'}`);
+      // Clear the flag BEFORE switching: setProjectionMode() calls
+      // orbit.update(), whose change event would re-enter onUserOrbit().
+      this.autoOrtho = false;
+      this.projectionBeforeAutoOrtho = null;
+      this.setProjectionMode('perspective');
+      if (!this.tween) {
+        this.currentViewKey = null;
+        this.updateViewLabel();
+      }
+      return;
     }
     this.autoOrtho = false;
     this.projectionBeforeAutoOrtho = null;
   }
 
-  /** Projection switch that PRESERVES the auto-ortho association. */
-  private setProjection(ortho: boolean): void {
-    if (this.editor.isOrtho === ortho) return;
-    this.editor.toggleProjection();
+  /** Projection switch used by auto-ortho; preserves the auto-ortho association. */
+  private setProjectionMode(mode: 'perspective' | 'orthographic'): void {
+    if (this.editor.projectionMode === mode) return;
+    this.editor.setProjectionMode(mode);
     this.updateToggleButton();
   }
 
   private updateToggleButton(): void {
-    this.btnToggle.title = `Toggle perspective/orthographic (currently ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'})`;
-    this.btnToggle.innerHTML = this.editor.isOrtho ? ICON_ORTHO : ICON_PERSP;
+    const mode = this.editor.projectionMode;
+    this.btnToggle.title = t('nav.toggleProjection', { mode: this.projectionLabel(mode) });
+    this.btnToggle.innerHTML =
+      mode === 'perspective' ? ICON_PERSP : mode === 'orthographic' ? ICON_ORTHO : ICON_ISO;
+  }
+
+  private projectionLabel(mode: ProjectionMode): string {
+    return mode === 'perspective'
+      ? t('nav.perspective')
+      : mode === 'orthographic'
+        ? t('nav.orthographic')
+        : t('nav.isometric');
   }
 
   private finishTween(): void {
@@ -506,12 +534,14 @@ export class NavigationGizmo {
     cam.quaternion.copy(tw.to);
     const dir = new THREE.Vector3(0, 0, 1).applyQuaternion(cam.quaternion);
     cam.position.copy(tw.target).addScaledVector(dir, tw.dist);
-    const label = `${tw.label.split(' ')[0]} ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'}`;
     this.tween = null;
     cam.up.copy(tw.up); // pole snaps keep their roll until the user orbits
     this.editor.orbit.enabled = true;
     this.editor.orbit.update();
-    this.setViewLabel(label);
+    // orbit.update() can fire a change → markUser() that clears the view key,
+    // so restore the target axis AFTER it and then refresh the caption.
+    this.currentViewKey = tw.viewKey;
+    this.updateViewLabel();
   }
 
   dolly(factor: number): void {
@@ -524,15 +554,27 @@ export class NavigationGizmo {
    * the user's explicit choice.
    */
   toggleProjection(): void {
-    this.setProjection(!this.editor.isOrtho);
+    if (this.tween) this.finishTween();
+    // Clear the auto-ortho association BEFORE switching: the mode change
+    // calls orbit.update(), whose change event would otherwise treat the
+    // isometric view as "rotated away" and restore perspective.
     this.autoOrtho = false;
     this.projectionBeforeAutoOrtho = null;
-    if (!this.tween) this.setViewLabel(`User ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'}`);
+    this.editor.toggleProjection();
+    this.currentViewKey = null;
+    if (!this.tween) this.updateViewLabel();
     this.updateToggleButton();
   }
 
   markUser(): void {
-    if (!this.tween) this.setViewLabel(`User ${this.editor.isOrtho ? 'Orthographic' : 'Perspective'}`);
+    this.currentViewKey = null;
+    // Orbiting away from the exact isometric axis turns it into a plain
+    // user orthographic view; the camera stays orthographic.
+    if (this.editor.projectionMode === 'isometric' && !this.editor.isIsometricOrientation()) {
+      this.editor.projectionMode = 'orthographic';
+      this.updateToggleButton();
+    }
+    if (!this.tween) this.updateViewLabel();
   }
 
   /**
@@ -549,6 +591,42 @@ export class NavigationGizmo {
       Math.abs(fwd.y) > AXIS_COS_EPS ||
       Math.abs(fwd.z) > AXIS_COS_EPS;
     if (!aligned) this.disarmAutoOrtho();
+  }
+
+  private viewLabelFor(nameKey: TranslationKey | null, mode: ProjectionMode): string {
+    // The standard isometric view is a view in its own right, not an axis view.
+    if (nameKey === null && mode === 'isometric') return t('nav.isometric');
+    return t('nav.view', {
+      view: nameKey ? t(nameKey) : t('nav.user'),
+      projection: this.projectionLabel(mode),
+    });
+  }
+
+  private updateViewLabel(): void {
+    this.setViewLabel(this.viewLabelFor(this.currentViewKey, this.editor.projectionMode));
+  }
+
+  /** Re-render the nav gizmo's DOM text after a language switch. */
+  refreshLanguage(): void {
+    this.btnZoomIn.title = t('nav.zoomIn');
+    this.btnZoomOut.title = t('nav.zoomOut');
+    this.updateToggleButton();
+    this.updateViewLabel();
+    if (this.hoverKey) {
+      const ball = this.balls.find((b) => b.key === this.hoverKey);
+      if (ball) this.tooltip.textContent = t(ball.nameKey);
+    }
+  }
+
+  /**
+   * Refresh the projection button + caption after an external mode change
+   * (Editor.setProjectionMode). Isometric is a view in its own right, so an
+   * old axis-view label is no longer meaningful.
+   */
+  refreshProjectionUi(): void {
+    if (this.editor.projectionMode === 'isometric') this.currentViewKey = null;
+    this.updateToggleButton();
+    this.updateViewLabel();
   }
 
   private setViewLabel(text: string): void {
@@ -606,3 +684,6 @@ const ICON_PERSP = `<svg width="15" height="15" viewBox="0 0 16 16" fill="none" 
   <path d="M2 3.5 L14 2 V14 L2 12.5 Z"/><path d="M5.5 3.1 V12.9 M9 2.7 V13.3"/></svg>`;
 const ICON_ORTHO = `<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
   <rect x="2.5" y="2.5" width="11" height="11"/><path d="M6 2.5 V13.5 M9.5 2.5 V13.5"/></svg>`;
+const ICON_ISO = `<svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
+  <path d="M8 1.4 L14.1 4.8 V11.2 L8 14.6 L1.9 11.2 V4.8 Z"/>
+  <path d="M1.9 4.8 L8 8.2 L14.1 4.8 M8 8.2 V14.6"/></svg>`;

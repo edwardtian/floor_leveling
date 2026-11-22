@@ -3,6 +3,7 @@ import type { Editor } from './editor';
 import type { MeshData, FFDSettings } from './types';
 import { FFDLattice } from './ffd';
 import { planarScaleRatios } from './transform';
+import { t } from './i18n';
 import type { History } from './history';
 
 /**
@@ -122,7 +123,7 @@ export class FFDTool {
       this.lattice!.controlPoints.set(cageAfter);
       this.syncVisuals();
     };
-    this.history.push({ name: 'Reset lattice', undo, redo });
+    this.history.push({ name: t('history.resetLattice'), undo, redo });
     this.onChanged();
   }
 
@@ -491,7 +492,10 @@ export class FFDTool {
         this.applyDeform();
         this.syncVisuals();
       };
-      this.history.push({ name: `FFD ${this.dragMode}`, undo, redo });
+      const modeKey =
+        this.dragMode === 'translate' ? 'gizmo.translate' :
+        this.dragMode === 'rotate' ? 'gizmo.rotate' : 'gizmo.scale';
+      this.history.push({ name: t('history.ffdDrag', { mode: t(modeKey) }), undo, redo });
     }
 
     (this as unknown as { pendingBefore?: Float32Array }).pendingBefore = undefined;

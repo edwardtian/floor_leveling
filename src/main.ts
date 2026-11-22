@@ -17,8 +17,15 @@ import {
 import { fmtLen, fmtBytes } from './units';
 import { formatBox, sceneBox, totalTriangles, totalVertices, downloadBlob, baseName } from './modelUtils';
 import { computeNormalizationForBox, normalizationSummaryForBox } from './transform';
+import {
+  getLang, initLang, onLangChange, setLang, t,
+  type Lang, type TranslationKey,
+} from './i18n';
 
 // ---------- core state ----------
+
+// Resolve the saved/initial language BEFORE any UI or 3D label is built.
+initLang();
 
 const history = new History();
 const viewport = document.getElementById('viewport')!;
@@ -40,10 +47,13 @@ const refTool = new RefTool(editor, history, refreshAll);
 // Live brush stats in the Floor ▸ Brush panel (no-op when it is not mounted).
 floorTool.onBrushDab = () => refreshBrushStats();
 
+// A language switch rebuilds every piece of UI/3D text.
+onLangChange(() => applyLanguage());
+
 editor.addGizmoDragStartListener(() => {
   if (activeModelSub() === 'ffd') ffdTool.beginGizmoDrag();
   if (currentTool === 'floor') floorTool.nodeTransform.onGizmoStart();
-  if (currentTool === 'ref') refTool.nodeTransform.onGizmoStart();
+  if (currentTool === 'ref') refTool.onGizmoStart();
 });
 editor.addGizmoDragEndListener(() => {
   if (activeModelSub() === 'ffd') ffdTool.endGizmoDrag();
@@ -58,7 +68,7 @@ editor.addGizmoDragEndListener(() => {
     buildPanel(); // refresh pending hint / Apply state
   }
   if (currentTool === 'ref') {
-    refTool.nodeTransform.attachGizmo(refTool.gizmoMode);
+    refTool.onGizmoEnd();
     buildPanel(); // re-seat fields + pending hint
   }
 });
@@ -73,7 +83,7 @@ editor.gizmo.addEventListener('objectChange', () => {
     for (const fn of floorTransformSyncers) fn();
   }
   if (currentTool === 'ref' && gizmoObj === refTool.nodeTransform.proxy) {
-    refTool.nodeTransform.onGizmoChange(refTool.gizmoMode);
+    refTool.onGizmoChange();
   }
 });
 
@@ -100,7 +110,7 @@ imageInput.addEventListener('change', () => {
   if (f) {
     refTool.loadImage(f)
       .then(() => {
-        toast(`Reference image "${f.name}" loaded — drag the gizmo to place it.`, 'ok');
+        toast(t('ref.loadedToast', { name: f.name }), 'ok');
         buildPanel();
       })
       .catch((e) => toast(String(e), 'err'));
@@ -112,7 +122,7 @@ imageInput.addEventListener('change', () => {
 
 async function importFromFile(file: File): Promise<void> {
   try {
-    setStatus(`Importing ${file.name}…`);
+    setStatus(t('status.importing', { name: file.name }));
     setTool('select');
     ffdTool.invalidate(); // new model → old lattice is meaningless
     // Discard pending object edits from the previous model; otherwise they
@@ -129,19 +139,27 @@ async function importFromFile(file: File): Promise<void> {
     importedFileName = file.name;
     history.clear();
     editor.setModel(res.root);
+    // The floor may already be visible in Model mode; fit it to the new model
+    // now, but leave the one-time first-activation fit armed so edits made
+    // before entering Floor mode are picked up too.
+    floorTool.fitToModel();
     for (const w of res.warnings) toast(w, 'info');
     setStatus(
-      `${file.name} — ${fmtNumber(totalTriangles(meshes))} tris · ` +
-      `${fmtNumber(totalVertices(meshes))} verts · ${formatBox(sceneBox(meshes), units)}`,
+      t('status.imported', {
+        name: file.name,
+        tris: fmtNumber(totalTriangles(meshes)),
+        verts: fmtNumber(totalVertices(meshes)),
+        box: formatBox(sceneBox(meshes), units),
+      }),
     );
     (document.getElementById('btn-export-glb') as HTMLButtonElement).disabled = false;
     (document.getElementById('btn-export-obj') as HTMLButtonElement).disabled = false;
     buildPanel();
-    toast(`Imported ${file.name}.`, 'ok');
+    toast(t('toast.imported', { name: file.name }), 'ok');
   } catch (e: any) {
     console.error(e);
-    toast(`Import failed: ${e?.message ?? e}`, 'err');
-    setStatus('Import failed.');
+    toast(t('toast.importFailed', { error: e?.message ?? e }), 'err');
+    setStatus(t('status.importFailed'));
   }
 }
 
@@ -161,12 +179,12 @@ async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
   // 1) Unapplied transform?
   if (transformTool.hasPending) {
     const choice = await modal(
-      'Unapplied transform',
-      'There is a pending object transform that is only <b>previewed</b>, not baked into the mesh.<br>Apply it before exporting?',
+      t('export.pendingTitle'),
+      t('export.pendingBody'),
       [
-        { label: 'Apply & continue', value: 'apply', primary: true },
-        { label: 'Discard pending', value: 'discard' },
-        { label: 'Cancel', value: 'cancel' },
+        { label: t('export.applyContinue'), value: 'apply', primary: true },
+        { label: t('export.discardPending'), value: 'discard' },
+        { label: t('export.cancel'), value: 'cancel' },
       ],
     );
     if (choice === 'cancel') return;
@@ -178,34 +196,36 @@ async function exportFlow(format: 'glb' | 'obj'): Promise<void> {
   const box = sceneBox(meshes);
   const norm = computeNormalizationForBox(box);
   const choice = await modal(
-    'Export options',
-    `<div class="kv"><span>Model size</span><b>${formatBox(box, units)}</b></div>
-     <div class="kv"><span>Triangles</span><b>${fmtNumber(totalTriangles(meshes))}</b></div>
-     <div style="margin:8px 0 4px;">Before export you may <b>normalize</b> the model
-     (uniform scale to 1 m max dimension, centered in XZ, feet at y&nbsp;=&nbsp;0):</div>
-     <div class="hint">${normalizationSummaryForBox(box, units)} → height ${fmtLen(norm.heightMeters, units)} (normalized).</div>
-     <div class="hint" style="margin-top:6px;">Floor plane, reference image and helpers are never exported.</div>`,
+    t('export.optionsTitle'),
+    `<div class="kv"><span>${t('export.modelSize')}</span><b>${formatBox(box, units)}</b></div>
+     <div class="kv"><span>${t('export.triangles')}</span><b>${fmtNumber(totalTriangles(meshes))}</b></div>
+     <div style="margin:8px 0 4px;">${t('export.normalizeIntro')}</div>
+     <div class="hint">${t('export.normalizeSummary', {
+       summary: normalizationSummaryForBox(box, units),
+       height: fmtLen(norm.heightMeters, units),
+     })}</div>
+     <div class="hint" style="margin-top:6px;">${t('export.neverExported')}</div>`,
     [
-      { label: 'Normalize & export', value: 'normalize', primary: true },
-      { label: 'Export as-is', value: 'asis' },
-      { label: 'Cancel', value: 'cancel' },
+      { label: t('export.normalizeExport'), value: 'normalize', primary: true },
+      { label: t('export.exportAsIs'), value: 'asis' },
+      { label: t('export.cancel'), value: 'cancel' },
     ],
   );
   if (choice === 'cancel') return;
 
   try {
-    setStatus('Exporting…');
+    setStatus(t('status.exporting'));
     const { blob, filename } = await exportModel(meshes, {
       format,
       filename: `${baseName(importedFileName || 'model')}_leveled`,
       normalize: choice === 'normalize',
     });
     downloadBlob(blob, filename);
-    setStatus(`Exported ${filename} (${fmtBytes(blob.size)}).`);
-    toast(`Exported ${filename}.`, 'ok');
+    setStatus(t('status.exported', { name: filename, size: fmtBytes(blob.size) }));
+    toast(t('toast.exported', { name: filename }), 'ok');
   } catch (e: any) {
     console.error(e);
-    toast(`Export failed: ${e?.message ?? e}`, 'err');
+    toast(t('toast.exportFailed', { error: e?.message ?? e }), 'err');
   }
 }
 
@@ -282,7 +302,7 @@ function applyToolState(): void {
     document.getElementById(btnId)!.classList.toggle('active', tabId === currentTool);
   }
   // Panel title + vertical Blender-style tab strip on the right edge.
-  const title = currentTool === 'model' ? 'Model' : currentTool === 'floor' ? 'Floor' : 'Reference image';
+  const title = currentTool === 'model' ? t('panel.model') : currentTool === 'floor' ? t('panel.floor') : t('panel.ref');
   panelTitle.textContent = title;
   const panel = document.getElementById('panel')!;
   const subtabs = document.getElementById('subtabs')!;
@@ -298,16 +318,16 @@ function applyToolState(): void {
   };
   if (currentTool === 'model') {
     for (const s of ['select', 'transform', 'ffd'] as const) {
-      const label = s === 'select' ? 'Info' : s === 'ffd' ? 'FFD' : s[0].toUpperCase() + s.slice(1);
+      const label = s === 'select' ? t('sub.info') : s === 'ffd' ? t('sub.ffd') : t('sub.transform');
       addSub(label, s === modelSub, () => setTool(s));
     }
   } else if (currentTool === 'floor') {
-    addSub('Floor', floorSub === 'floor', () => { floorSub = 'floor'; applyToolState(); });
-    addSub('Brush', floorSub === 'brush', () => { floorSub = 'brush'; applyToolState(); });
-    addSub('Transform', floorSub === 'transform', () => { floorSub = 'transform'; applyToolState(); });
+    addSub(t('sub.floor'), floorSub === 'floor', () => { floorSub = 'floor'; applyToolState(); });
+    addSub(t('sub.brush'), floorSub === 'brush', () => { floorSub = 'brush'; applyToolState(); });
+    addSub(t('sub.transform'), floorSub === 'transform', () => { floorSub = 'transform'; applyToolState(); });
   } else {
-    addSub('Image', refSub === 'image', () => { refSub = 'image'; applyToolState(); });
-    addSub('Transform', refSub === 'transform', () => { refSub = 'transform'; applyToolState(); });
+    addSub(t('sub.image'), refSub === 'image', () => { refSub = 'image'; applyToolState(); });
+    addSub(t('sub.transform'), refSub === 'transform', () => { refSub = 'transform'; applyToolState(); });
   }
   panel.dataset.subtabs = String(count);
   buildPanel();
@@ -332,8 +352,8 @@ for (const [toolId, btnId] of [
 (document.getElementById('chk-showfloor') as HTMLInputElement).addEventListener('change', (e) => {
   const v = (e.target as HTMLInputElement).checked;
   floorTool.uiVisible = v;
-  floorTool.planeVisuals.plane.visible = v && floorTool.active;
-  floorTool.planeVisuals.outline.visible = v && floorTool.active;
+  if (v) floorTool.fitIfPending();
+  floorTool.applyVisibility();
   refreshAll(); // checkbox state re-derived from objects
 });
 (document.getElementById('chk-showref') as HTMLInputElement).addEventListener('change', (e) => {
@@ -346,36 +366,49 @@ for (const [toolId, btnId] of [
 (document.getElementById('chk-showgrid') as HTMLInputElement).addEventListener('change', (e) => {
   editor.setGridVisible((e.target as HTMLInputElement).checked);
 });
+(document.getElementById('chk-showlabels') as HTMLInputElement).addEventListener('change', (e) => {
+  editor.setLabelsVisible((e.target as HTMLInputElement).checked);
+  refreshAll();
+});
+
+// EN | 中文 switch in the top-right corner.
+for (const b of document.querySelectorAll<HTMLButtonElement>('#lang-switch button')) {
+  b.addEventListener('click', () => {
+    const lang = b.dataset.lang as Lang;
+    if (lang === 'en' || lang === 'zh') setLang(lang); // listener applies the UI
+  });
+}
 
 /**
  * Mirror the topbar checkboxes to the live object state: Floor visible =
- * plane shown (tool active + uiVisible), Ref = image loaded AND shown,
- * Wire/Grid from the editor. Called on every refreshAll.
+ * uiVisible (any tool mode), Ref = image loaded AND shown,
+ * Wire/Grid/Label from the editor. Called on every refreshAll.
  */
 function syncTopbarChecks(): void {
-  const floor = floorTool.uiVisible && floorTool.active;
+  const floor = floorTool.uiVisible;
   (document.getElementById('chk-showfloor') as HTMLInputElement).checked = floor;
   (document.getElementById('chk-showref') as HTMLInputElement).checked = refTool.hasImage && refTool.group.visible;
   (document.getElementById('chk-showwires') as HTMLInputElement).checked = editor.isWireframe;
   (document.getElementById('chk-showgrid') as HTMLInputElement).checked = editor.isGridVisible;
+  (document.getElementById('chk-showlabels') as HTMLInputElement).checked = editor.isLabelsVisible;
 }
 
 function doUndo(): void {
   const cmd = history.undo();
   if (!cmd) {
-    toast('Nothing to undo.');
+    toast(t('toast.nothingToUndo'));
     return;
   }
-  afterHistoryJump(`Undo: ${cmd.name}`);
+  afterHistoryJump(t('toast.undo', { name: cmd.name }));
 }
 
 function doRedo(): void {
   const cmd = history.redo();
   if (!cmd) {
-    toast('Nothing to redo.');
+    toast(t('toast.nothingToRedo'));
     return;
   }
-  afterHistoryJump(`Redo: ${cmd.name}`);
+  afterHistoryJump(t('toast.redo', { name: cmd.name }));
 }
 
 function afterHistoryJump(label: string): void {
@@ -411,7 +444,7 @@ function manipulatorCtx(): ManipulatorCtx | null {
     return {
       getMode: () => floorTool.gizmoMode,
       setMode: (m) => floorTool.setGizmoMode(m),
-      label: 'Floor',
+      label: t('object.floor'),
       ready: true,
     };
   }
@@ -419,7 +452,7 @@ function manipulatorCtx(): ManipulatorCtx | null {
     return {
       getMode: () => refTool.gizmoMode,
       setMode: (m) => refTool.setGizmoMode(m),
-      label: 'Ref image',
+      label: t('object.refImage'),
       ready: refTool.hasImage,
     };
   }
@@ -428,7 +461,7 @@ function manipulatorCtx(): ManipulatorCtx | null {
     return {
       getMode: () => ffdTool.gizmoMode,
       setMode: (m) => ffdTool.setGizmoMode(m),
-      label: 'FFD',
+      label: t('object.ffd'),
       ready: !!ffdTool.lattice,
     };
   }
@@ -436,14 +469,16 @@ function manipulatorCtx(): ManipulatorCtx | null {
     return {
       getMode: () => transformTool.gizmoMode,
       setMode: (m) => transformTool.setGizmoMode(m),
-      label: 'Model',
+      label: t('object.model'),
       ready: meshes.length > 0,
     };
   }
   return null; // Info sub-panel: no manipulator active yet
 }
 
-const MODE_LABELS = { translate: 'Move', rotate: 'Rotate', scale: 'Scale' } as const;
+function modeLabel(mode: 'translate' | 'rotate' | 'scale'): string {
+  return t(mode === 'translate' ? 'gizmo.translate' : mode === 'rotate' ? 'gizmo.rotate' : 'gizmo.scale');
+}
 
 /**
  * Q/W/E/R/Tab act on the CURRENT object's manipulator: the model (Transform
@@ -458,7 +493,7 @@ function handleManipulatorKey(e: KeyboardEvent): void {
 
   if (e.key.toLowerCase() === 'q') {
     setTool('select');
-    toast('Select', 'info');
+    toast(t('toast.selectTool'), 'info');
     return;
   }
 
@@ -483,11 +518,11 @@ function handleManipulatorKey(e: KeyboardEvent): void {
     setTool('transform');
     const mode = isW ? 'translate' : isE ? 'rotate' : isR ? 'scale' : 'translate';
     transformTool.setGizmoMode(mode);
-    toast(MODE_LABELS[mode], 'info');
+    toast(modeLabel(mode), 'info');
     return;
   }
   if (!ctx.ready) {
-    toast(`${ctx.label}: nothing to manipulate yet`, 'info');
+    toast(t('toast.nothingToManipulate', { target: ctx.label }), 'info');
     return;
   }
 
@@ -495,11 +530,11 @@ function handleManipulatorKey(e: KeyboardEvent): void {
     const modes = ['translate', 'rotate', 'scale'] as const;
     const next = modes[(modes.indexOf(ctx.getMode()) + 1) % modes.length];
     ctx.setMode(next);
-    toast(`${ctx.label}: ${MODE_LABELS[next]}`, 'info');
+    toast(t('toast.mode', { target: ctx.label, mode: modeLabel(next) }), 'info');
   } else {
     const mode = isW ? 'translate' : isE ? 'rotate' : 'scale';
     ctx.setMode(mode);
-    toast(`${ctx.label}: ${MODE_LABELS[mode]}`, 'info');
+    toast(t('toast.mode', { target: ctx.label, mode: modeLabel(mode) }), 'info');
   }
   buildPanel(); // keep the panel's T/R/S buttons in sync
 }
@@ -592,14 +627,14 @@ editor.renderer.domElement.addEventListener('pointerleave', () => {
 
 function handleFFDPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEvent): void {
   if (!ffdTool.lattice) {
-    toast('Build the FFD lattice first (press "Create lattice").');
+    toast(t('ffd.buildFirst'));
     return;
   }
   if (rect) {
     const ids = ffdTool.pointsInRect(rect);
     ffdTool.select(ids, additiveDown);
     if (ids.length) {
-      toast(`${ids.length} control point(s) selected — drag the gizmo to deform.`);
+      toast(t('ffd.pointsSelected', { n: ids.length }));
     }
   } else {
     const id = ffdTool.pointAt(pointerDownNdc);
@@ -622,7 +657,7 @@ function handleFFDPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEven
 
 function handleFloorPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEvent): void {
   if (floorTool.areas.length === 0) {
-    toast('No areas yet — move the plane into the model; the highlight is automatic.');
+    toast(t('floor.noAreasYetToast'));
     return;
   }
   if (rect) {
@@ -639,13 +674,13 @@ function handleFloorPointerUp(rect: ReturnType<Editor['endRect']>, _e: PointerEv
     }
     if (found.size) {
       floorTool.setSelectedAreas([...found]);
-      toast(`${found.size} area(s) selected.`);
+      toast(t('floor.areasSelected', { n: found.size }));
     }
   } else {
     const id = floorTool.areaAt(pointerDownNdc);
     if (id >= 0) {
       floorTool.toggleArea(id, additiveDown);
-      toast(`Area ${id} ${additiveDown ? 'toggled' : 'selected'} — now Drop or Flatten.`);
+      toast(t(additiveDown ? 'floor.areaToggled' : 'floor.areaSelected', { id }));
     } else if (!additiveDown) {
       floorTool.selectArea(-1);
     }
@@ -666,23 +701,37 @@ function buildPanel(): void {
     else if (sub === 'transform') buildTransformPanel();
     else if (sub === 'ffd') buildFFDPanel();
   } else if (currentTool === 'floor') {
-    if (floorSub === 'transform') buildNodeTransformPanel('Floor', () => floorTool.gizmoMode, (m) => floorTool.setGizmoMode(m), () => floorTool.hasPendingTransform(), () => floorTool.applyTransform(), () => floorTool.resetTransform());
+    if (floorSub === 'transform') buildNodeTransformPanel('object.floor', () => floorTool.gizmoMode, (m) => floorTool.setGizmoMode(m), () => floorTool.hasPendingTransform(), () => floorTool.applyTransform(), () => floorTool.resetTransform());
     else if (floorSub === 'brush') buildBrushPanel();
     else buildFloorPanel();
   } else if (currentTool === 'ref') {
-    if (refSub === 'transform') buildNodeTransformPanel('Image', () => refTool.gizmoMode, (m) => refTool.setGizmoMode(m), () => refTool.hasPendingTransform(), () => refTool.applyTransform(), () => refTool.resetTransform());
-    else buildRefPanel();
+    if (refSub === 'transform') {
+      buildNodeTransformPanel(
+        'object.image',
+        () => refTool.gizmoMode,
+        (m) => refTool.setGizmoMode(m),
+        () => refTool.hasPendingTransform(),
+        () => refTool.applyTransform(),
+        () => refTool.resetTransform(),
+        {
+          rotation: 'spin2d',
+          getSpin: () => refTool.state.angleDeg,
+          setSpin: (v) => refTool.setAngleDeg(v),
+          scaleAxes: 'xy',
+        },
+      );
+    } else buildRefPanel();
   }
 }
 
 function buildSelectPanel(): void {
-  panelTitle.textContent = 'Scene';
-  const g = group('Model', panelBody);
+  panelTitle.textContent = t('panel.scene');
+  const g = group(t('info.modelGroup'), panelBody);
   if (meshes.length === 0) {
-    g.body.appendChild(hint('No model loaded. Use "Import…" (glb / fbx / obj).'));
+    g.body.appendChild(hint(t('info.noModel')));
   } else {
     if (meshes.length > 1) {
-      const sel = selectField('Mesh', meshes.map((m, i) => ({ value: String(i), label: m.name })), String(activeMeshIndex), (v) => {
+      const sel = selectField(t('info.mesh'), meshes.map((m, i) => ({ value: String(i), label: m.name })), String(activeMeshIndex), (v) => {
         switchActiveMesh(parseInt(v, 10));
       });
       g.body.appendChild(sel.root);
@@ -691,33 +740,30 @@ function buildSelectPanel(): void {
     active.geometry.computeBoundingBox();
     const info = el('div');
     info.innerHTML =
-      `<div class="kv"><span>Name</span><b>${escapeHtml(active.name)}</b></div>` +
-      `<div class="kv"><span>Triangles</span><b>${fmtNumber(active.triCount)}</b></div>` +
-      `<div class="kv"><span>Vertices</span><b>${fmtNumber(active.geometry.getAttribute('position').count)}</b></div>` +
-      `<div class="kv"><span>Size</span><b>${formatBox(sceneBox(meshes), units)}</b></div>` +
-      `<div class="kv"><span>Height</span><b>${fmtLen(sceneBox(meshes).getSize(new THREE.Vector3()).y, units)}</b></div>`;
+      `<div class="kv"><span>${t('info.name')}</span><b>${escapeHtml(active.name)}</b></div>` +
+      `<div class="kv"><span>${t('info.triangles')}</span><b>${fmtNumber(active.triCount)}</b></div>` +
+      `<div class="kv"><span>${t('info.vertices')}</span><b>${fmtNumber(active.geometry.getAttribute('position').count)}</b></div>` +
+      `<div class="kv"><span>${t('info.size')}</span><b>${formatBox(sceneBox(meshes), units)}</b></div>` +
+      `<div class="kv"><span>${t('info.height')}</span><b>${fmtLen(sceneBox(meshes).getSize(new THREE.Vector3()).y, units)}</b></div>`;
     g.body.appendChild(info);
   }
-  const gu = group('Units', panelBody);
+  const gu = group(t('info.unitsGroup'), panelBody);
   gu.body.appendChild(
-    selectField('Display', [
-      { value: 'meter', label: 'meters (m)' },
-      { value: 'centimeter', label: 'centimeters (cm)' },
+    selectField(t('info.display'), [
+      { value: 'meter', label: t('unit.meterLong') },
+      { value: 'centimeter', label: t('unit.centimeterLong') },
     ], units, (v) => setUnits(v as MeasurementUnits)).root,
   );
-  gu.body.appendChild(hint('Scene space is meters. Labels on the grid ruler follow this setting.'));
-  const gh = group('Workflow', panelBody);
-  gh.body.appendChild(hint(
-    '1 Import → 2 Transform (rotate/apply) → 3 FFD (free-form deform) → 4 Floor plane → ' +
-    '5 Auto-highlighted intersections → 6 Brush / Drop / Flatten → repeat. Ctrl+Z undo.',
-  ));
+  gu.body.appendChild(hint(t('info.unitsHint')));
+  const gh = group(t('info.workflowGroup'), panelBody);
+  gh.body.appendChild(hint(t('info.workflowHint')));
 }
 
 function switchActiveMesh(i: number): void {
   if (transformTool.hasPending) {
     transformTool.resetPending();
     transformTool.clearPreview();
-    toast('Pending transform discarded (mesh switched).');
+    toast(t('toast.pendingDiscarded'));
   }
   activeMeshIndex = i;
   ffdTool.invalidate(); // rest positions captured for another mesh
@@ -737,50 +783,50 @@ function setUnits(u: MeasurementUnits): void {
 }
 
 function buildTransformPanel(): void {
-  panelTitle.textContent = 'Transform (Apply-style)';
+  panelTitle.textContent = t('panel.transform');
   if (!meshes.length) {
-    panelBody.appendChild(hint('Import a model first.'));
+    panelBody.appendChild(hint(t('info.importFirst')));
     return;
   }
-  const t = transformTool.pending;
+  const pending = transformTool.pending;
 
-  const gm = group('Gizmo', panelBody);
+  const gm = group(t('transform.gizmo'), panelBody);
   gm.body.appendChild(gizmoModeButtons((m) => transformTool.setGizmoMode(m), transformTool.gizmoMode));
-  gm.body.appendChild(hint('Drag the gizmo to preview. Nothing is baked until you press Apply.'));
+  gm.body.appendChild(hint(t('transform.gizmoHint')));
 
-  const gr = group('Rotation (degrees)', panelBody);
+  const gr = group(t('transform.rotation'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
     const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
-    gr.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; transformTool.preview(); refreshAll(); }, { step: 1, axis: ax }));
+    gr.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = v; transformTool.preview(); refreshAll(); }, { step: 1, axis: ax }));
   }
 
-  const gt = group('Translation', panelBody);
+  const gt = group(t('transform.translation'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
-    const f = unitField(ax.toUpperCase(), t[`t${ax}`], () => units, (v) => { t[`t${ax}`] = v; transformTool.preview(); refreshAll(); }, { axis: ax });
+    const f = unitField(ax.toUpperCase(), pending[`t${ax}`], () => units, (v) => { pending[`t${ax}`] = v; transformTool.preview(); refreshAll(); }, { axis: ax });
     unitRefreshers.push(f.refresh);
     gt.body.appendChild(f.root);
   }
 
-  const gs = group('Scale', panelBody);
+  const gs = group(t('transform.scale'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
     const k = `s${ax}` as 'sx' | 'sy' | 'sz';
-    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = nonZeroScale(v); transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+    gs.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = nonZeroScale(v); transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
   }
 
-  const ga = group('Apply', panelBody);
-  const applyBtn = button('Apply transform (bake into mesh)', () => {
+  const ga = group(t('transform.applyGroup'), panelBody);
+  const applyBtn = button(t('transform.applyMesh'), () => {
     if (transformTool.apply()) {
-      toast('Transform baked into geometry.', 'ok');
+      toast(t('transform.bakedMesh'), 'ok');
       buildPanel(); // re-bind the fields to the reset pending object
       refreshAll();
-    } else toast('No pending transform.');
+    } else toast(t('transform.noPending'));
   }, 'btn primary');
   applyBtn.style.width = '100%';
   ga.body.appendChild(applyBtn);
-  const resetBtn = button('Reset pending', () => { transformTool.resetPending(); buildPanel(); refreshAll(); });
+  const resetBtn = button(t('transform.resetPending'), () => { transformTool.resetPending(); buildPanel(); refreshAll(); });
   resetBtn.style.width = '100%';
   ga.body.appendChild(resetBtn);
-  ga.body.appendChild(hint('Rotation/scale pivot = mesh bounding-box center. Translation is in world axes.'));
+  ga.body.appendChild(hint(t('transform.pivotModel')));
 }
 
 /**
@@ -788,62 +834,83 @@ function buildTransformPanel(): void {
  * group layout as the model's Transform panel: Gizmo / Rotation / Translation
  * / Scale / Apply. Values live-read the object's pending transform.
  */
+interface NodeTransformPanelOptions {
+  /** Ref image uses a single billboard-relative 2D spin instead of XYZ. */
+  rotation?: 'xyz' | 'spin2d';
+  getSpin?: () => number;
+  setSpin?: (v: number) => void;
+  /** Ref image scales only in its local X/Y (Z is the image normal). */
+  scaleAxes?: 'xyz' | 'xy';
+}
+
 function buildNodeTransformPanel(
-  label: string,
+  targetKey: 'object.floor' | 'object.image',
   getMode: () => 'translate' | 'rotate' | 'scale',
   setMode: (m: 'translate' | 'rotate' | 'scale') => void,
   hasPending: () => boolean,
   applyFn: () => boolean,
   resetFn: () => void,
+  options?: NodeTransformPanelOptions,
 ): void {
+  panelTitle.textContent = targetKey === 'object.floor' ? t('panel.floor') : t('panel.ref');
+  const target = t(targetKey);
   const nt = currentTool === 'floor' ? floorTool.nodeTransform : refTool.nodeTransform;
-  const t = nt.pending;
+  const pending = nt.pending;
 
-  const gm = group('Gizmo', panelBody);
+  const gm = group(t('transform.gizmo'), panelBody);
   gm.body.appendChild(gizmoModeButtons(setMode, getMode()));
-  gm.body.appendChild(hint('Drag the gizmo to preview. Nothing is baked until you press Apply.'));
+  gm.body.appendChild(hint(t('transform.gizmoHint')));
 
-  const gr = group('Rotation (degrees)', panelBody);
-  for (const ax of ['x', 'y', 'z'] as const) {
-    const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
-    gr.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = v; nt.preview(); refreshAll(); }, { step: 1, axis: ax }));
+  if (options?.rotation === 'spin2d') {
+    const gr = group(t('transform.rotation2d'), panelBody);
+    gr.body.appendChild(numField(t('ref.spin'), options.getSpin?.() ?? 0, (v) => {
+      options.setSpin?.(v);
+      refreshAll();
+    }, { step: 1 }));
+  } else {
+    const gr = group(t('transform.rotation'), panelBody);
+    for (const ax of ['x', 'y', 'z'] as const) {
+      const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
+      gr.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = v; nt.preview(); refreshAll(); }, { step: 1, axis: ax }));
+    }
   }
 
-  const gt = group('Translation', panelBody);
+  const gt = group(t('transform.translation'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
-    const f = unitField(ax.toUpperCase(), t[`t${ax}`], () => units, (v) => { t[`t${ax}`] = v; nt.preview(); refreshAll(); }, { axis: ax });
+    const f = unitField(ax.toUpperCase(), pending[`t${ax}`], () => units, (v) => { pending[`t${ax}`] = v; nt.preview(); refreshAll(); }, { axis: ax });
     unitRefreshers.push(f.refresh);
     gt.body.appendChild(f.root);
   }
 
-  const gs = group('Scale', panelBody);
-  for (const ax of ['x', 'y', 'z'] as const) {
+  const gs = group(t('transform.scale'), panelBody);
+  const scaleAxes = options?.scaleAxes === 'xy' ? (['x', 'y'] as const) : (['x', 'y', 'z'] as const);
+  for (const ax of scaleAxes) {
     const k = `s${ax}` as 'sx' | 'sy' | 'sz';
-    gs.body.appendChild(numField(ax.toUpperCase(), t[k], (v) => { t[k] = nonZeroScale(v); nt.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+    gs.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = nonZeroScale(v); nt.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
   }
 
-  const ga = group('Apply', panelBody);
-  const applyBtn = button(`Apply transform (bake into ${label.toLowerCase()})`, () => {
+  const ga = group(t('transform.applyGroup'), panelBody);
+  const applyBtn = button(t('transform.applyInto', { target: target.toLowerCase() }), () => {
     if (applyFn()) {
-      toast(`${label} transform baked.`, 'ok');
+      toast(t('transform.bakedTarget', { target }), 'ok');
       buildPanel();
       refreshAll();
-    } else toast('No pending transform.');
+    } else toast(t('transform.noPending'));
   }, 'btn primary');
   applyBtn.style.width = '100%';
-  const resetBtn = button('Reset pending', () => { resetFn(); buildPanel(); });
+  const resetBtn = button(t('transform.resetPending'), () => { resetFn(); buildPanel(); });
   resetBtn.style.width = '100%';
   ga.body.append(applyBtn, resetBtn);
-  ga.body.appendChild(hint(hasPending()
-    ? '⚠ Pending transform (previewed, not baked). Apply or Reset.'
-    : 'Rotation/scale pivot = the object origin. Translation is in world axes.'));
+  ga.body.appendChild(hint(hasPending() ? t('transform.pendingHint') : t('transform.pivotObject')));
 }
 
 function gizmoModeButtons(setMode: (m: 'translate' | 'rotate' | 'scale') => void, active: string): HTMLDivElement {
   const row = el('div', 'row');
   for (const m of ['translate', 'rotate', 'scale'] as const) {
-    const b = button(m[0].toUpperCase() + m.slice(1, 3), () => setMode(m), `btn small${m === active ? ' primary' : ''}`);
+    const shortKey = m === 'translate' ? 'gizmo.short.translate' : m === 'rotate' ? 'gizmo.short.rotate' : 'gizmo.short.scale';
+    const b = button(t(shortKey), () => setMode(m), `btn small${m === active ? ' primary' : ''}`);
     b.dataset.mode = m;
+    b.title = modeLabel(m);
     b.addEventListener('click', () => {
       for (const c of row.querySelectorAll('button')) c.classList.remove('primary');
       b.classList.add('primary');
@@ -854,45 +921,45 @@ function gizmoModeButtons(setMode: (m: 'translate' | 'rotate' | 'scale') => void
 }
 
 function buildFFDPanel(): void {
-  panelTitle.textContent = 'Free-Form Deformation (FFD)';
+  panelTitle.textContent = t('panel.ffd');
   if (!meshes.length) {
-    panelBody.appendChild(hint('Import a model first.'));
+    panelBody.appendChild(hint(t('info.importFirst')));
     return;
   }
   const s = ffdTool.settings;
 
-  const gl = group('Lattice', panelBody);
+  const gl = group(t('ffd.latticeGroup'), panelBody);
   const rowDim = el('div', 'row');
   rowDim.appendChild(numField('X', s.nx, (v) => { s.nx = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20, axis: 'x' }));
   rowDim.appendChild(numField('Y', s.ny, (v) => { s.ny = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20, axis: 'y' }));
   rowDim.appendChild(numField('Z', s.nz, (v) => { s.nz = THREE.MathUtils.clamp(Math.round(v), 2, 20); if (ffdTool.lattice) rebuildFFD(); }, { integer: true, min: 2, max: 20, axis: 'z' }));
   gl.body.appendChild(rowDim);
-  gl.body.appendChild(slider('Cage margin', s.margin, 0, 0.3, 0.01, (v) => { s.margin = v; if (ffdTool.lattice) rebuildFFD(); }));
+  gl.body.appendChild(slider(t('ffd.cageMargin'), s.margin, 0, 0.3, 0.01, (v) => { s.margin = v; if (ffdTool.lattice) rebuildFFD(); }));
   const rowL = el('div', 'row');
-  const latticeBtn = button(ffdTool.lattice ? 'Rebuild lattice' : 'Create lattice', () => rebuildFFD(), 'btn primary');
+  const latticeBtn = button(ffdTool.lattice ? t('ffd.rebuild') : t('ffd.create'), () => rebuildFFD(), 'btn primary');
   latticeBtn.id = 'ffd-lattice-btn';
   rowL.appendChild(latticeBtn);
-  rowL.appendChild(button('Reset', () => { ffdTool.reset(); toast('Lattice reset to the rest cage.', 'ok'); }));
-  rowL.appendChild(button('Collapse', () => {
+  rowL.appendChild(button(t('ffd.reset'), () => { ffdTool.reset(); toast(t('ffd.resetToast'), 'ok'); }));
+  rowL.appendChild(button(t('ffd.collapse'), () => {
     if (!ffdTool.lattice) {
-      toast('No lattice to collapse.', 'info');
+      toast(t('ffd.noLatticeToCollapse'), 'info');
       return;
     }
     ffdTool.collapse();
     refreshFFDLatticeButton();
-    toast('Lattice removed — shape stays as deformed.', 'ok');
+    toast(t('ffd.collapsedToast'), 'ok');
   }));
   gl.body.appendChild(rowL);
-  gl.body.appendChild(hint('The lattice wraps the whole model. Click control points to select (Shift = add), drag on empty space for a rect, then drag the gizmo: the surface deforms smoothly.'));
+  gl.body.appendChild(hint(t('ffd.latticeHint')));
 
-  const gs = group('Selection', panelBody);
+  const gs = group(t('ffd.selectionGroup'), panelBody);
   const info = el('div', 'hint', '');
   info.id = 'ffd-info';
   gs.body.appendChild(info);
   const rowBtns = el('div', 'row');
-  rowBtns.appendChild(button('All', () => { ffdTool.selectAll(); }));
-  rowBtns.appendChild(button('None', () => { ffdTool.clearSelection(); }));
-  rowBtns.appendChild(button('Corners', () => selectFFDCorners()));
+  rowBtns.appendChild(button(t('ffd.all'), () => { ffdTool.selectAll(); }));
+  rowBtns.appendChild(button(t('ffd.none'), () => { ffdTool.clearSelection(); }));
+  rowBtns.appendChild(button(t('ffd.corners'), () => selectFFDCorners()));
   gs.body.appendChild(rowBtns);
   gs.body.appendChild(gizmoModeButtons((m) => ffdTool.setGizmoMode(m), ffdTool.gizmoMode));
 
@@ -913,7 +980,11 @@ function selectFFDCorners(): void {
 
 function rebuildFFD(): void {
   if (ffdTool.build()) {
-    toast(`FFD lattice ${ffdTool.settings.nx}×${ffdTool.settings.ny}×${ffdTool.settings.nz} created.`, 'ok');
+    toast(t('ffd.created', {
+      nx: ffdTool.settings.nx,
+      ny: ffdTool.settings.ny,
+      nz: ffdTool.settings.nz,
+    }), 'ok');
   }
   refreshFFDLatticeButton();
   refreshFFDInfo();
@@ -922,7 +993,7 @@ function rebuildFFD(): void {
 /** Keep the primary lattice button label in sync with the tool state. */
 function refreshFFDLatticeButton(): void {
   const b = document.getElementById('ffd-lattice-btn') as HTMLButtonElement | null;
-  if (b) b.textContent = ffdTool.lattice ? 'Rebuild lattice' : 'Create lattice';
+  if (b) b.textContent = ffdTool.lattice ? t('ffd.rebuild') : t('ffd.create');
 }
 
 function refreshFFDInfo(): void {
@@ -930,16 +1001,19 @@ function refreshFFDInfo(): void {
   if (!info) return;
   const lat = ffdTool.lattice;
   if (!lat) {
-    info.textContent = 'No lattice yet.';
+    info.textContent = t('ffd.noLattice');
   } else {
-    info.textContent = `${lat.nx}×${lat.ny}×${lat.nz} = ${lat.count} control points · ${ffdTool.selected.size} selected.`;
+    info.textContent = t('ffd.info', {
+      nx: lat.nx, ny: lat.ny, nz: lat.nz,
+      count: lat.count, selected: ffdTool.selected.size,
+    });
   }
 }
 
 function buildFloorPanel(): void {
-  panelTitle.textContent = 'Floor';
+  panelTitle.textContent = t('panel.floor');
   if (!meshes.length) {
-    panelBody.appendChild(hint('Import a model first.'));
+    panelBody.appendChild(hint(t('info.importFirst')));
     return;
   }
   const s = floorTool.settings;
@@ -947,9 +1021,9 @@ function buildFloorPanel(): void {
   // NOTE: transform gizmo/apply/reset lives in the Transform SUB-TAB
   // (buildNodeTransformPanel) — same layout as the model's Transform panel.
   if (floorTool.hasPendingTransform()) {
-    panelBody.appendChild(hint('⚠ Pending floor transform (previewed). Use the Transform sub-tab to Apply or Reset.'));
+    panelBody.appendChild(hint(t('transform.floorPendingHint')));
   }
-  const gp = group('Floor plane', panelBody);
+  const gp = group(t('floor.planeGroup'), panelBody);
 
   // All fields go through the SAME pending transform as the Transform
   // sub-panel: they read the PREVIEWED state and write via setWorld* —
@@ -957,12 +1031,12 @@ function buildFloorPanel(): void {
   // model / floor / ref image.
   const nt = floorTool.nodeTransform;
   const previewed = () => nt.previewedTRS();
-  const fx = unitField('Width X', s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); }, { axis: 'x' });
-  const fz = unitField('Depth Z', s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); }, { axis: 'z' });
-  const fy = unitField('Height Y', s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); }, { axis: 'y' });
-  const fcx = unitField('Center X', s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); }, { axis: 'x' });
-  const fcz = unitField('Center Z', s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); }, { axis: 'z' });
-  const rot = numField('Spin / tilt (deg)', floorTool.rotationDeg.y, (v) => nt.setWorldRotationDeg({ y: v }), { step: 1 });
+  const fx = unitField(t('floor.widthX'), s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); }, { axis: 'x' });
+  const fz = unitField(t('floor.depthZ'), s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); }, { axis: 'z' });
+  const fy = unitField(t('floor.heightY'), s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); }, { axis: 'y' });
+  const fcx = unitField(t('floor.centerX'), s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); }, { axis: 'x' });
+  const fcz = unitField(t('floor.centerZ'), s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); }, { axis: 'z' });
+  const rot = numField(t('floor.spin'), floorTool.rotationDeg.y, (v) => nt.setWorldRotationDeg({ y: v }), { step: 1 });
   const sync = () => {
     const trs = previewed();
     fx.set(trs.scale.x); fz.set(trs.scale.z); fy.set(trs.pos.y); fcx.set(trs.pos.x); fcz.set(trs.pos.z);
@@ -976,8 +1050,8 @@ function buildFloorPanel(): void {
   gp.body.append(fx.root, fz.root, fy.root, fcx.root, fcz.root, rot);
 
   const rowFit = el('div', 'row');
-  const fitBtn = button('Fit to model', () => { floorTool.fitToModel(true); buildPanel(); });
-  const bottomBtn = button('Floor @ bottom', () => {
+  const fitBtn = button(t('floor.fit'), () => { floorTool.fitToModel(true); buildPanel(); });
+  const bottomBtn = button(t('floor.bottom'), () => {
     const m = meshes[activeMeshIndex];
     m.geometry.computeBoundingBox();
     s.y = m.geometry.boundingBox!.min.y;
@@ -988,34 +1062,27 @@ function buildFloorPanel(): void {
   gp.body.appendChild(rowFit);
 
 
-  const gscan = group('Intersections', panelBody);
-  const scanBtn = button('Rescan now', () => {
+  const gscan = group(t('floor.intersectionsGroup'), panelBody);
+  const scanBtn = button(t('floor.rescan'), () => {
     const n = floorTool.scan();
-    toast(n ? `${n} intersecting area(s) found — click one to select.` : 'No intersections. Move the plane into the model.', n ? 'ok' : 'info');
+    toast(n ? t('floor.scanFound', { n }) : t('floor.scanNone'), n ? 'ok' : 'info');
     refreshFloorAreas(true);
   });
   scanBtn.style.width = '100%';
   gscan.body.appendChild(scanBtn);
-  gscan.body.appendChild(hint(
-    'The highlight is live: it updates automatically while the plane moves or you paint in Brush. ' +
-    'Bright orange = triangles accurately crossing the plane · yellow line = exact cut contour · ' +
-    'green = flat on the plane · dim = buried below.',
-  ));
+  gscan.body.appendChild(hint(t('floor.highlightHint')));
   const list = el('div');
   list.id = 'floor-areas';
   gscan.body.appendChild(list);
   refreshFloorAreas(true);
 
-  const gl = group('Level selection', panelBody);
+  const gl = group(t('floor.levelGroup'), panelBody);
   const rowL = el('div', 'row');
-  const dropBtn = button('Drop', () => levelAndReport('drop'), 'btn primary');
-  const flatBtn = button('Flatten', () => levelAndReport('flatten'));
+  const dropBtn = button(t('floor.drop'), () => levelAndReport('drop'), 'btn primary');
+  const flatBtn = button(t('floor.flatten'), () => levelAndReport('flatten'));
   rowL.append(dropBtn, flatBtn);
   gl.body.appendChild(rowL);
-  gl.body.appendChild(hint(
-    'Drop = rigid translate of the whole selection until its lowest point touches the plane. ' +
-    'Flatten = vertices below the plane are pulled onto it. Both blend smoothly at the region border.',
-  ));
+  gl.body.appendChild(hint(t('floor.levelHint')));
 }
 
 /**
@@ -1024,14 +1091,14 @@ function buildFloorPanel(): void {
  * sphere centered where the cursor meets the floor plane.
  */
 function buildBrushPanel(): void {
-  panelTitle.textContent = 'Floor — Brush';
+  panelTitle.textContent = t('panel.floorBrush');
   if (!meshes.length) {
-    panelBody.appendChild(hint('Import a model first.'));
+    panelBody.appendChild(hint(t('info.importFirst')));
     return;
   }
   const s = floorTool.brushSettings;
 
-  const g = group('Brush', panelBody);
+  const g = group(t('brush.group'), panelBody);
 
   const canvas = document.createElement('canvas');
   canvas.id = 'brush-curve';
@@ -1040,24 +1107,24 @@ function buildBrushPanel(): void {
   const refreshCurve = (): void => drawBrushCurve(canvas, s);
 
   let fFalloff: UnitField | null = null;
-  const fRadius = unitField('Brush radius', s.radius, () => units, (v) => {
+  const fRadius = unitField(t('brush.radius'), s.radius, () => units, (v) => {
     s.radius = Math.max(0.01, v);
     if (s.falloffRadius > s.radius) s.falloffRadius = s.radius;
     fFalloff?.set(s.falloffRadius);
     refreshCurve();
   }, { min: 0.01, step: 0.1 });
-  fFalloff = unitField('Falloff radius', s.falloffRadius, () => units, (v) => {
+  fFalloff = unitField(t('brush.falloffRadius'), s.falloffRadius, () => units, (v) => {
     s.falloffRadius = THREE.MathUtils.clamp(v, 0, s.radius);
     fFalloff?.set(s.falloffRadius);
     refreshCurve();
   }, { min: 0, step: 0.1 });
   unitRefreshers.push(fRadius.refresh, fFalloff.refresh);
   g.body.append(fRadius.root, fFalloff.root);
-  g.body.appendChild(hint('Full strength inside Falloff radius, easing to zero at Brush radius.'));
+  g.body.appendChild(hint(t('brush.radiusHint')));
 
-  const curveField = selectField('Falloff curve', [
-    { value: 'smoothstep', label: 'Smooth Step' },
-    { value: 'gaussian', label: 'Gaussian' },
+  const curveField = selectField(t('brush.curve'), [
+    { value: 'smoothstep', label: t('brush.smoothstep') },
+    { value: 'gaussian', label: t('brush.gaussian') },
   ], s.curve, (v) => {
     s.curve = v as BrushCurve;
     refreshCurve();
@@ -1065,16 +1132,16 @@ function buildBrushPanel(): void {
   curveField.select.style.width = '132px';
   g.body.appendChild(curveField.root);
 
-  g.body.appendChild(slider('Curve hardness', s.hardness, 0, 1, 0.01, (v) => {
+  g.body.appendChild(slider(t('brush.hardness'), s.hardness, 0, 1, 0.01, (v) => {
     s.hardness = v;
     refreshCurve();
   }));
-  g.body.appendChild(slider('Strength', s.strength, 0.05, 1, 0.01, (v) => {
+  g.body.appendChild(slider(t('brush.strength'), s.strength, 0.05, 1, 0.01, (v) => {
     s.strength = v;
     refreshCurve();
   }));
 
-  g.body.appendChild(checkbox('Show affected vertices', floorTool.brushShowPreview, (v) => {
+  g.body.appendChild(checkbox(t('brush.showPreview'), floorTool.brushShowPreview, (v) => {
     floorTool.brushShowPreview = v;
   }));
 
@@ -1085,20 +1152,12 @@ function buildBrushPanel(): void {
   g.body.appendChild(stats);
   refreshBrushStats();
 
-  g.body.appendChild(hint(
-    'Left-drag on the model to paint. The brush is a sphere centered where the cursor meets the floor plane: ' +
-    'vertices above the plane are pushed down, vertices below are pulled up, and only the nearest vertices ' +
-    'inside the radius move. Right-drag pans; drag the nav gizmo to orbit.',
-  ));
+  g.body.appendChild(hint(t('brush.paintHint')));
 
-  const gl = group('Live intersection', panelBody);
-  gl.body.appendChild(hint(
-    'The intersection highlight updates automatically while you paint or move the plane: ' +
-    'bright orange = crossing the plane, yellow line = exact cut contour, green = flat on the plane, ' +
-    'dim = buried below. A whole left-drag is one undo step.',
-  ));
+  const gl = group(t('brush.liveGroup'), panelBody);
+  gl.body.appendChild(hint(t('brush.liveHint')));
   const row = el('div', 'row');
-  row.appendChild(button('Rescan now', () => { floorTool.scan(); refreshBrushStats(); }));
+  row.appendChild(button(t('floor.rescan'), () => { floorTool.scan(); refreshBrushStats(); }));
   gl.body.appendChild(row);
 }
 
@@ -1194,12 +1253,15 @@ function refreshBrushStats(): void {
   if (!el) return;
   const r = floorTool.lastBrushResult;
   if (!r) {
-    el.textContent = 'No stroke yet — left-drag on the model to snap vertices.';
+    el.textContent = t('brush.statsNone');
     return;
   }
-  el.textContent =
-    `Last dab: ${r.affected} affected · ${r.moved} snapped · max Δ ${fmtLen(r.maxShift, units)}` +
-    ` · stroke moves: ${r.totalMoved}`;
+  el.textContent = t('brush.stats', {
+    affected: r.affected,
+    moved: r.moved,
+    max: fmtLen(r.maxShift, units),
+    total: r.totalMoved,
+  });
 }
 
 let floorFieldAppliers: (() => void)[] = [];
@@ -1229,15 +1291,15 @@ function refreshFloorAreas(force = false): void {
   lastAreaListSig = sig;
   list.innerHTML = '';
   if (!areas.length) {
-    list.appendChild(hint('No intersections yet — move the plane into the model; the highlight is automatic.'));
+    list.appendChild(hint(t('floor.noAreas')));
     return;
   }
   const wrap = el('div', 'row');
   for (const a of areas.slice(0, 24)) {
     const sel = floorTool.selectedAreas.has(a.id);
-    const b = el('span', `badge${sel ? ' on' : ''}`, `#${a.id} · ${a.count}f`);
+    const b = el('span', `badge${sel ? ' on' : ''}`, t('floor.areaBadge', { id: a.id, count: a.count }));
     b.classList.add('segment-badge');
-    b.title = `y ${fmtLen(a.minY, units)} … ${fmtLen(a.maxY, units)}`;
+    b.title = t('floor.areaBadgeTitle', { min: fmtLen(a.minY, units), max: fmtLen(a.maxY, units) });
     b.addEventListener('click', () => {
       floorTool.toggleArea(a.id, false);
       refreshFloorAreas(true);
@@ -1250,51 +1312,47 @@ function refreshFloorAreas(force = false): void {
 function levelAndReport(mode: 'drop' | 'flatten'): void {
   const ok = floorTool.level(mode);
   if (ok) {
-    toast(mode === 'drop' ? 'Dropped selection onto the floor plane.' : 'Flattened selection to the floor plane.', 'ok');
+    toast(t(mode === 'drop' ? 'floor.droppedToast' : 'floor.flattenedToast'), 'ok');
     refreshFloorAreas(true);
     refreshAll();
   } else {
-    toast('Select an area first (click a highlighted region).');
+    toast(t('floor.selectAreaFirst'));
   }
 }
 
 function buildRefPanel(): void {
-  panelTitle.textContent = 'Reference image';
-  const gi = group('Image', panelBody);
+  panelTitle.textContent = t('panel.ref');
+  const gi = group(t('ref.group'), panelBody);
   if (!refTool.hasImage) {
-    const btn = button('Load image…', () => imageInput.click(), 'btn primary');
+    const btn = button(t('ref.load'), () => imageInput.click(), 'btn primary');
     btn.style.width = '100%';
     gi.body.appendChild(btn);
-    gi.body.appendChild(hint('The image becomes a guide plane you can move/rotate/scale — like tracing paper over the model.'));
+    gi.body.appendChild(hint(t('ref.loadHint')));
   } else {
-    gi.body.appendChild(hint(`Loaded: ${refTool.name}`));
-    const btn = button('Replace image…', () => imageInput.click());
-    const clr = button('Remove', () => { refTool.clearImage(); buildPanel(); }, 'btn danger');
+    gi.body.appendChild(hint(t('ref.loaded', { name: refTool.name })));
+    const btn = button(t('ref.replace'), () => imageInput.click());
+    const clr = button(t('ref.remove'), () => { refTool.clearImage(); buildPanel(); }, 'btn danger');
     const row = el('div', 'row');
     row.append(btn, clr);
     gi.body.appendChild(row);
+    gi.body.appendChild(hint(t('ref.lockedHint')));
   }
 
   if (refTool.hasImage) {
     // NOTE: transform gizmo/apply/reset lives in the Transform SUB-TAB.
     if (refTool.hasPendingTransform()) {
-      panelBody.appendChild(hint('⚠ Pending image transform (previewed). Use the Transform sub-tab to Apply or Reset.'));
+      panelBody.appendChild(hint(t('transform.imagePendingHint')));
     }
-    const go = group('Placement', panelBody);
-    const ori = selectField('Orientation', [
-      { value: 'horizontal', label: 'Horizontal (floor)' },
-      { value: 'vertical', label: 'Vertical (wall)' },
-    ], refTool.getOrientation(), (v) => { refTool.setOrientation(v as any); buildPanel(); });
-    go.body.appendChild(ori.root);
+    const go = group(t('ref.placement'), panelBody);
     const st = refTool.state;
-    const fy = unitField('Height Y', st.y, () => units, (v) => refTool.setY(v));
-    const fw = unitField('Width', st.w, () => units, (v) => refTool.setWidth(v));
-    const fh = unitField('Height', st.h, () => units, (v) => refTool.setHeight(v));
-    const fa = numField('Spin (deg)', st.angleDeg, (v) => refTool.setAngleDeg(v), { step: 1 });
+    const fy = unitField(t('ref.heightY'), st.y, () => units, (v) => refTool.setY(v));
+    const fw = unitField(t('ref.width'), st.w, () => units, (v) => refTool.setWidth(v));
+    const fh = unitField(t('ref.height'), st.h, () => units, (v) => refTool.setHeight(v));
+    const fa = numField(t('ref.spin'), st.angleDeg, (v) => refTool.setAngleDeg(v), { step: 1 });
     unitRefreshers.push(fy.refresh, fw.refresh, fh.refresh);
     go.body.append(fy.root, fw.root, fh.root, fa);
-    const gop = group('Opacity', panelBody);
-    gop.body.appendChild(slider('Opacity', refTool.opacity, 0.05, 1, 0.05, (v) => refTool.setOpacity(v)));
+    const gop = group(t('ref.opacity'), panelBody);
+    gop.body.appendChild(slider(t('ref.opacity'), refTool.opacity, 0.05, 1, 0.05, (v) => refTool.setOpacity(v)));
   }
 }
 // ---------- status / refresh ----------
@@ -1312,16 +1370,31 @@ function refreshAll(): void {
   const parts: string[] = [];
   if (importedFileName) {
     parts.push(importedFileName);
-    parts.push(`${fmtNumber(totalTriangles(meshes))} tris · ${formatBox(sceneBox(meshes), units)}`);
+    parts.push(t('status.meshInfo', {
+      tris: fmtNumber(totalTriangles(meshes)),
+      box: formatBox(sceneBox(meshes), units),
+    }));
   }
-  if (transformTool.hasPending) parts.push('⚠ pending transform (not applied)');
-  if (ffdTool.lattice) parts.push(`FFD: ${ffdTool.selected.size}/${ffdTool.lattice.count} points selected`);
-  if (floorTool.areas.length) parts.push(`floor areas: ${floorTool.areas.length} (${floorTool.selectedAreas.size} selected)`);
+  if (transformTool.hasPending) parts.push(t('status.pendingTransform'));
+  if (ffdTool.lattice) {
+    parts.push(t('status.ffdSelection', {
+      selected: ffdTool.selected.size,
+      total: ffdTool.lattice.count,
+    }));
+  }
+  if (floorTool.areas.length) {
+    parts.push(t('status.floorAreas', {
+      n: floorTool.areas.length,
+      m: floorTool.selectedAreas.size,
+    }));
+  }
   if (parts.length) setStatus(parts.join('  ·  '));
   const ffdInfo = document.getElementById('ffd-info');
   if (ffdInfo) {
     const lat = ffdTool.lattice;
-    ffdInfo.textContent = lat ? `${lat.nx}×${lat.ny}×${lat.nz} = ${lat.count} control points · ${ffdTool.selected.size} selected.` : 'No lattice yet.';
+    ffdInfo.textContent = lat
+      ? t('ffd.info', { nx: lat.nx, ny: lat.ny, nz: lat.nz, count: lat.count, selected: ffdTool.selected.size })
+      : t('ffd.noLattice');
   }
 }
 
@@ -1329,11 +1402,69 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
+// ---------- language ----------
+
+/** Translate static HTML marked with data-i18n / -title / -aria. */
+function applyStaticI18n(): void {
+  for (const el of document.querySelectorAll<HTMLElement>('[data-i18n]')) {
+    const key = el.dataset.i18n as TranslationKey | undefined;
+    if (key) el.textContent = t(key);
+  }
+  for (const el of document.querySelectorAll<HTMLElement>('[data-i18n-title]')) {
+    const key = el.dataset.i18nTitle as TranslationKey | undefined;
+    if (key) el.title = t(key);
+  }
+  for (const el of document.querySelectorAll<HTMLElement>('[data-i18n-aria]')) {
+    const key = el.dataset.i18nAria as TranslationKey | undefined;
+    if (key) el.setAttribute('aria-label', t(key));
+  }
+}
+
+function updateLangSwitch(): void {
+  const lang = getLang();
+  for (const b of document.querySelectorAll<HTMLButtonElement>('#lang-switch button')) {
+    b.classList.toggle('active', b.dataset.lang === lang);
+  }
+  document.documentElement.lang = lang === 'zh' ? 'zh-CN' : 'en';
+}
+
+/** Re-label the vertical sub-tabs in place (language switch). */
+function refreshSubtabs(): void {
+  const buttons = [...document.querySelectorAll<HTMLButtonElement>('#subtabs button')];
+  let labels: string[];
+  if (currentTool === 'model') labels = [t('sub.info'), t('sub.transform'), t('sub.ffd')];
+  else if (currentTool === 'floor') labels = [t('sub.floor'), t('sub.brush'), t('sub.transform')];
+  else labels = [t('sub.image'), t('sub.transform')];
+  buttons.forEach((b, i) => {
+    if (labels[i]) b.textContent = labels[i];
+  });
+}
+
+/** Re-render every translated surface after a language switch. */
+function applyLanguage(): void {
+  // A transient toast in the old language would look out of place.
+  const toastEl = document.getElementById('toast');
+  if (toastEl) toastEl.classList.add('hidden');
+  applyStaticI18n();
+  updateLangSwitch();
+  document.title = t('app.title');
+  editor.rebuildGrid();
+  floorTool.rebuildFloorLabel();
+  editor.navGizmo.refreshLanguage();
+  buildPanel();
+  refreshSubtabs();
+  if (meshes.length === 0) setStatus(t('status.initial'));
+  else refreshAll();
+}
+
 // ---------- boot ----------
 
+applyStaticI18n();
+updateLangSwitch();
+document.title = t('app.title');
 refreshAll();
 setTool('select');
-setStatus('Import a model to begin (glb / fbx / obj).');
+setStatus(t('status.initial'));
 
 // Debug/testing hooks (also used by the smoke test).
 import * as THREE_NS from 'three';
@@ -1347,6 +1478,10 @@ import * as THREE_NS from 'three';
   refTool,
   setTool,
   buildPanel,
+  setUnits,
+  setLanguage: (lang: Lang) => setLang(lang),
+  getLanguage: getLang,
+  t,
   THREE: THREE_NS,
 };
 // Property-style accessors for the test harness.

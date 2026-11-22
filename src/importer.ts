@@ -4,6 +4,7 @@ import { FBXLoader } from 'three/examples/jsm/loaders/FBXLoader.js';
 import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader.js';
 import type { MeshData } from './types';
 import { collectMeshes, makeMeshData, fileExtension } from './modelUtils';
+import { t } from './i18n';
 
 export interface ImportResult {
   root: THREE.Group;
@@ -30,34 +31,34 @@ export async function importModel(file: File): Promise<ImportResult> {
     const gltf = await loader.parseAsync(buffer, '');
     root = gltf.scene;
     if (gltf.animations && gltf.animations.length > 0) {
-      warnings.push(`${gltf.animations.length} animation(s) ignored (static pose used).`);
+      warnings.push(t('import.animationIgnored', { n: gltf.animations.length }));
     }
   } else if (ext === 'fbx') {
     const loader = new FBXLoader();
     root = loader.parse(buffer as ArrayBuffer, '');
     if ((root as any).animations?.length) {
-      warnings.push(`${(root as any).animations.length} animation(s) ignored (static pose used).`);
+      warnings.push(t('import.animationIgnored', { n: (root as any).animations.length }));
     }
   } else if (ext === 'obj') {
     const text = new TextDecoder().decode(buffer as ArrayBuffer);
     const loader = new OBJLoader();
     root = loader.parse(text);
-    warnings.push('OBJ: materials/textures not loaded (geometry only).');
+    warnings.push(t('import.objMaterials'));
   } else {
-    throw new Error(`Unsupported format ".${ext}" — use GLB, GLTF, FBX or OBJ.`);
+    throw new Error(t('import.unsupported', { ext }));
   }
 
   const group = new THREE.Group();
   group.name = 'ImportedModel';
 
   const rawMeshes = collectMeshes(root);
-  if (rawMeshes.length === 0) throw new Error('No meshes found in file.');
+  if (rawMeshes.length === 0) throw new Error(t('import.noMeshes'));
 
   const meshes: MeshData[] = [];
   rawMeshes.forEach((mesh, i) => {
     mesh.updateWorldMatrix(true, false);
     const skinned = (mesh as any).isSkinnedMesh === true;
-    if (skinned) warnings.push(`"${mesh.name || i}" is skinned — bind pose baked as static geometry.`);
+    if (skinned) warnings.push(t('import.skinned', { name: mesh.name || i }));
 
     const geom = mesh.geometry.clone();
     geom.applyMatrix4(mesh.matrixWorld); // transforms positions + normals + tangents

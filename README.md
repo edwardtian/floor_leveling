@@ -16,7 +16,7 @@ Other scripts:
 
 ```bash
 pnpm build          # typecheck + production build (dist/)
-node scripts/smoke.mjs   # headless end-to-end test (123 checks, system Chrome)
+node scripts/smoke.mjs   # headless end-to-end test (142 checks, system Chrome)
 ```
 
 ## Workflow
@@ -29,7 +29,58 @@ The toolbar on the left walks through the requirements:
 | **Transform** | Rotate/translate/scale the whole object with the gizmo or numeric fields. Nothing touches the mesh until **Apply transform** bakes it into the vertex data (like Blender's *Apply Transform*). Planar scale handles (XY/YZ/XZ) use one shared ratio for both axes. |
 | **FFD** | A 3D lattice wraps the model. Click control points (Shift = add, drag = rect-select) and move/rotate/scale them with the gizmo to deform the surface smoothly. **Collapse** bakes the current cage into the mesh, so the next lattice wraps the collapsed shape. |
 | **Floor** | Create a floor plane you can **move / rotate / scale directly in the viewport** (Translate/Rotate/Scale gizmo, T/R/S buttons in the panel) or via numeric fields (width/depth/height/center, spin/tilt, "Fit to model", "Floor @ bottom"). The plane may be tilted — leveling works along the plane's own normal. The **intersection highlight is automatic and live**: moving the plane, painting and undo/redo refresh it, and returning to Floor after model edits rescans immediately. Bright orange = triangles accurately crossing the plane, yellow line = exact cut contour, green = flat on the plane, dim = buried below. The **Brush** sub-panel snaps only the nearest vertices onto the plane (push down above it, pull up below it) with adjustable radius, falloff radius and curve. The Floor sub-panel also lists connected areas (numbered, click / Shift-click / rect-select) for **Drop** (rigid translate until the lowest point touches the plane) or **Flatten** (pull vertices below onto it), both blended with a smooth falloff. Repeat as often as you like — every operation, including a whole brush stroke, is undoable (Ctrl+Z / Ctrl+Shift+Z). |
-| **Ref Image** | Load an image as a guide plane (horizontal/vertical, opacity slider, translate/rotate/scale via gizmo or fields). Purely a visual guide. |
+| **Ref Image** | Load an image as a **camera-facing billboard** guide. In Ref Image mode you can translate, scale (local X/Y) and rotate it in **2D** (screen-plane spin); in other modes the transform is locked and the topbar Ref toggle only shows/hides it. Purely a visual guide, never exported. |
+
+## Topbar toggles
+
+**Floor / Ref / Wire / Grid / Label** switch scene helpers:
+
+- **Floor** — show/hide the floor plane and its outline in any tool mode
+  (Model, Floor or Ref). The plane is fitted to the imported model even while
+  you stay in Model mode, so it works as a ground reference; the `floor` tag
+  follows while the Floor tool is active.
+- **Ref** — show/hide the reference image in any tool mode; editing is available only in Ref Image mode.
+- **Wire** — wireframe view of the model.
+- **Grid** — major/minor grid lines, the axes and the ruler labels.
+- **Label** — all 3D text labels: the grid distance numbers, the `X (m)` /
+  `Z (m)` (or `cm`) unit captions, and the `floor` tag. Grid lines and axes
+  stay visible, so you can keep the ruler but remove the text.
+
+**Label** is independent of **Grid**: with Grid off the whole ruler disappears;
+with Grid on, **Label** alone controls the text.
+
+## Languages
+
+The top-right **EN | 中文** switch translates the whole app: topbar, toolbar,
+panel titles/groups/fields/hints, buttons, toasts, status bar, navigation-gizmo
+captions, the `floor` / `地面` tag, and the grid axis captions
+(`X (m)` / `X（米）`). On first visit it follows the browser language
+(`zh*` → 中文), then remembers your choice in `localStorage`, so it survives a
+reload.
+
+![Chinese UI](.smoke/21-chinese-ui.png)
+
+## Reference image
+
+The reference image is a **camera-facing billboard**, not a world-axis-aligned
+plane: it always faces the viewport camera, so it stays readable while you
+orbit. It is drawn as an overlay (like tracing paper) and is never exported.
+
+- **Ref Image mode** is the only place it can be transformed:
+  - translate (world XYZ, gizmo or Transform fields),
+  - scale (local X/Y = width/height; the Z handle is hidden),
+  - rotate in **2D only** — the rotate gizmo exposes just the local Z ring and
+    the panel has a single **Spin (2D)** field.
+- In **Model / Floor** mode the transform is locked (gizmo detached); the
+  topbar **Ref** toggle only shows/hides it. The billboard still turns to face
+  the camera.
+- The Ref panel shows width/height/height-Y/spin/opacity; the Transform
+  sub-tab has the gizmo, translation, scale and Apply/Reset for the pending
+  translation/scale.
+
+![Reference image billboard](.smoke/08-reference.png)
+
+![2D rotate gizmo](.smoke/20-ref-rotate2d.png)
 
 ## Floor brush
 
@@ -83,12 +134,14 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
 
 - **Six axis balls** (solid = positive axis, hollow ring = negative; X red, Y green, Z blue). Click one to smoothly snap to that view — Right / Left / Top / Bottom / Front / Back. Horizontal snaps roll with world-up; pole snaps (Top/Bottom) keep a map-like roll, exactly like Blender.
 - **Same-ball flip**: clicking the ball of the view you're already in flips to the opposite side (Front ⇄ Back, Right ⇄ Left, Top ⇄ Bottom) — also via the ring band of the aligned far ball.
-- **Auto-orthographic**: landing on an exact axis view switches the viewport to orthographic; rotating away from it (gizmo drag or mouse-orbit) restores the projection you had before. Toggling projection *manually* (button / Numpad 5) is an override — rotating away keeps your explicit choice.
+- **Auto-orthographic**: landing on an exact axis view switches the viewport to orthographic; rotating away from it (gizmo drag or mouse-orbit) restores the projection you had before. Toggling projection *manually* (button / Numpad 5) is an override — rotating away keeps your explicit choice. Snapping to an axis from isometric leaves isometric mode and enters the axis view.
 - **Drag the gizmo** anywhere to orbit the view (trackball-style), like dragging the sphere in Blender.
-- **Zoom ±** buttons and a **perspective/orthographic toggle** below the ball (Blender's vertical stack); the toggle preserves the framing (Blender's Numpad 5).
-- **Keyboard** follows Blender's numpad: `1` Front, `3` Right, `7` Top (+`Ctrl` for the opposite view), `5` ortho toggle, `+` / `−` zoom (top-row `=`/`-` work too).
-- The caption under the gizmo shows the current state ("Front Orthographic", "User Perspective", ...).
-- In orthographic mode, zooming adjusts the frustum scale instead of dollying, and the TransformControls gizmo adapts automatically.
+- **Zoom ±** buttons and a **projection toggle** below the ball (Blender's vertical stack). It cycles **Perspective → Orthographic → Isometric**: perspective ↔ orthographic keeps the current orientation and framing, while isometric switches to an orthographic camera at the standard isometric angle (45° azimuth, ~35.26° elevation). The button icon and tooltip show the current mode.
+- **Keyboard** follows Blender's numpad: `1` Front, `3` Right, `7` Top (+`Ctrl` for the opposite view), `5` cycles perspective/orthographic/isometric, `+` / `−` zoom (top-row `=`/`-` work too).
+- The caption under the gizmo shows the current state ("Front Orthographic", "User Perspective", "Isometric", ...).
+- In orthographic/isometric mode, zooming adjusts the frustum scale instead of dollying, and the TransformControls gizmo adapts automatically.
+
+![Isometric projection](.smoke/16-nav-iso.png)
 
 ## Keyboard shortcuts
 
@@ -102,7 +155,7 @@ A Blender-style view gizmo lives in the **top-right corner, in its own overlay s
 | `R` | **Scale** the active object |
 | `Tab` | Cycle the active object's Move → Rotate → Scale |
 
-"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Info (Select) tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. In **Floor ▸ Brush**, left-drag paints, so `W`/`E`/`R`/`Tab` first leave Brush and open the floor plane's Transform panel with its gizmo. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` toggles ortho, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
+"Active object" = whichever tool is current: the model (Transform or FFD lattice), the floor plane, or the reference image. From the Info (Select) tool, `W`/`E`/`R`/`Tab` activate the model manipulator. If the active object has nothing to manipulate yet (no reference image loaded, FFD lattice collapsed), the keypress reports that instead of switching tools. In **Floor ▸ Brush**, left-drag paints, so `W`/`E`/`R`/`Tab` first leave Brush and open the floor plane's Transform panel with its gizmo. Numpad `1`/`3`/`7` (+`Ctrl`) snap views, `5` cycles perspective/orthographic/isometric, `+`/`−` zoom. Shortcuts are ignored while typing in a field and when a modal dialog is open. Every edit is undoable with `Ctrl+Z` / `Ctrl+Shift+Z`.
 
 ## Export
 
@@ -154,5 +207,5 @@ src/
   leveling.ts      plane intersection (crossing/on-plane/cut segments), drop/flatten math
   history.ts       undo/redo stack
   ui.ts            DOM helpers, toasts, modals
-scripts/smoke.mjs  headless end-to-end test (123 checks)
+scripts/smoke.mjs  headless end-to-end test (142 checks)
 ```

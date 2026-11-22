@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import type { Editor } from './editor';
 import { DEFAULT_TRANSFORM, TransformValues, planarScaleRatios, transformChanged } from './transform';
+import { t } from './i18n';
 import type { History } from './history';
 
 /**
@@ -30,6 +31,8 @@ export class PendingNodeTransform {
   } | null = null;
   /** Mode the proxy is currently attached with (for re-seating). */
   private gizmoMode: 'translate' | 'rotate' | 'scale' = 'translate';
+  /** Space used by the current gizmo (ref image uses local for 2D rotate/scale). */
+  private gizmoSpace: 'world' | 'local' = 'world';
   private changeListeners: (() => void)[] = [];
 
   constructor(editor: Editor, history: History | null, onChanged: () => void, proxyName: string) {
@@ -136,15 +139,16 @@ export class PendingNodeTransform {
   }
 
   /** Gizmo attach at the previewed pivot, oriented to the previewed rotation. */
-  attachGizmo(mode: 'translate' | 'rotate' | 'scale'): void {
+  attachGizmo(mode: 'translate' | 'rotate' | 'scale', space: 'world' | 'local' = this.gizmoSpace): void {
     const n = this.node;
     if (!n) return;
     this.gizmoMode = mode;
+    this.gizmoSpace = space;
     const trs = this.previewedTRS();
     this.proxy.position.copy(trs.pos);
     this.proxy.quaternion.copy(this.previewedQuaternion());
     this.proxy.scale.set(1, 1, 1);
-    this.editor.attachGizmo(this.proxy, mode, 'world');
+    this.editor.attachGizmo(this.proxy, mode, space);
   }
 
   detachGizmo(): void {
@@ -230,7 +234,7 @@ export class PendingNodeTransform {
         this.syncGizmoIfIdle();
       };
       this.history.push({
-        name: 'Apply transform',
+        name: t('history.applyTransform'),
         undo: () => applyTRS(before),
         redo: () => applyTRS(after),
       });
