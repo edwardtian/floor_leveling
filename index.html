@@ -22,6 +22,24 @@
       <label class="chk"><input type="checkbox" id="chk-showgrid" checked /> <span data-i18n="topbar.grid">Grid</span></label>
       <label class="chk"><input type="checkbox" id="chk-showlabels" checked /> <span data-i18n="topbar.label">Label</span></label>
       <span class="sep"></span>
+      <span id="increment-group" class="increments" role="group" data-i18n-aria="increments.aria" aria-label="Transform increments">
+        <label class="inc">
+          <span class="inc-key" data-i18n="increments.translateShort">T</span>
+          <input id="inc-translate" type="number" min="0" step="0.01" value="0.01" data-i18n-title="increments.translate" title="Translate increment" />
+          <span id="inc-translate-unit" class="inc-unit">m</span>
+        </label>
+        <label class="inc">
+          <span class="inc-key" data-i18n="increments.rotateShort">R</span>
+          <input id="inc-rotate" type="number" min="0" step="1" value="5" data-i18n-title="increments.rotate" title="Rotate increment" />
+          <span class="inc-unit">°</span>
+        </label>
+        <label class="inc">
+          <span class="inc-key" data-i18n="increments.scaleShort">S</span>
+          <input id="inc-scale" type="number" min="0" step="0.01" value="0.01" data-i18n-title="increments.scale" title="Scale increment" />
+          <span class="inc-unit">×</span>
+        </label>
+      </span>
+      <span class="sep"></span>
       <span id="status" class="status">Import a model to begin.</span>
       <span id="lang-switch" class="lang-switch" role="group" data-i18n-aria="lang.aria" aria-label="Language">
         <button type="button" data-lang="en" class="active">EN</button>

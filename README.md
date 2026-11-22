@@ -16,7 +16,7 @@ Other scripts:
 
 ```bash
 pnpm build          # typecheck + production build (dist/)
-node scripts/smoke.mjs   # headless end-to-end test (142 checks, system Chrome)
+node scripts/smoke.mjs   # headless end-to-end test (149 checks, system Chrome)
 ```
 
 ## Workflow
@@ -48,6 +48,26 @@ The toolbar on the left walks through the requirements:
 
 **Label** is independent of **Grid**: with Grid off the whole ruler disappears;
 with Grid on, **Label** alone controls the text.
+
+### Transform increments and numeric scrubbing
+
+The compact **T / R / S** fields in the topbar set the transform increments:
+
+- **T** — translate step in the active display unit (m or cm); stored in scene
+  meters.
+- **R** — rotate step in degrees.
+- **S** — scale step as a factor (e.g. `0.01` = 1 %).
+
+They drive **TransformControls snapping** on the gizmo and the drag step of
+numeric fields in the transform panels. Set a value to `0` to disable gizmo
+snapping for that mode; fields then fall back to their own step. The values are
+saved in `localStorage`.
+
+All numeric fields in the transform panels are **drag-scrubbable**: drag right
+to increase and left to decrease. A simple click focuses the field for direct
+typing. The drag step follows the matching topbar increment (translate /
+rotate / scale), so the same settings apply to the Model, Floor and Ref Image
+transform panels.
 
 ## Languages
 
@@ -207,5 +227,5 @@ src/
   leveling.ts      plane intersection (crossing/on-plane/cut segments), drop/flatten math
   history.ts       undo/redo stack
   ui.ts            DOM helpers, toasts, modals
-scripts/smoke.mjs  headless end-to-end test (142 checks)
+scripts/smoke.mjs  headless end-to-end test (149 checks)
 ```

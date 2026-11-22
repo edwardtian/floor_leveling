@@ -2451,7 +2451,158 @@ ok('planar scale uses one shared ratio for both axes',
 
 await page.screenshot({ path: `${ROOT}/.smoke/09-final.png` });
 
-// ---- 10. i18n: EN | 中文 switch at the top-right
+// ---- 10. topbar transform increments + drag-scrub numeric fields
+await page.evaluate(() => window.__FL__.setUnits('meter'));
+await page.evaluate(() => window.__FL__.setTool('transform'));
+await page.waitForTimeout(200);
+const incDefaults = await page.evaluate(() => ({
+  group: !!document.getElementById('increment-group'),
+  t: document.getElementById('inc-translate').value,
+  r: document.getElementById('inc-rotate').value,
+  s: document.getElementById('inc-scale').value,
+  unit: document.getElementById('inc-translate-unit').textContent,
+  tSnap: window.__FL__.editor.gizmo.translationSnap,
+  rSnap: window.__FL__.editor.gizmo.rotationSnap,
+  sSnap: window.__FL__.editor.gizmo.scaleSnap,
+}));
+ok('topbar increments exist with defaults',
+  incDefaults.group && incDefaults.t === '0.01' && incDefaults.r === '5' &&
+  incDefaults.s === '0.01' && incDefaults.unit === 'm' &&
+  Math.abs(incDefaults.tSnap - 0.01) < 1e-9 &&
+  Math.abs(incDefaults.rSnap - 5 * Math.PI / 180) < 1e-9 &&
+  Math.abs(incDefaults.sSnap - 0.01) < 1e-9,
+  JSON.stringify(incDefaults));
+
+await page.fill('#inc-translate', '0.02');
+await page.press('#inc-translate', 'Enter');
+await page.fill('#inc-rotate', '10');
+await page.press('#inc-rotate', 'Enter');
+await page.fill('#inc-scale', '0.05');
+await page.press('#inc-scale', 'Enter');
+await page.waitForTimeout(150);
+const incChanged = await page.evaluate(() => ({
+  t: document.getElementById('inc-translate').value,
+  r: document.getElementById('inc-rotate').value,
+  s: document.getElementById('inc-scale').value,
+  tSnap: window.__FL__.editor.gizmo.translationSnap,
+  rSnap: window.__FL__.editor.gizmo.rotationSnap,
+  sSnap: window.__FL__.editor.gizmo.scaleSnap,
+  stored: localStorage.getItem('floor-leveling.increments') || '',
+}));
+ok('topbar increments update gizmo snapping',
+  incChanged.t === '0.02' && incChanged.r === '10' && incChanged.s === '0.05' &&
+  Math.abs(incChanged.tSnap - 0.02) < 1e-9 &&
+  Math.abs(incChanged.rSnap - 10 * Math.PI / 180) < 1e-9 &&
+  Math.abs(incChanged.sSnap - 0.05) < 1e-9 &&
+  incChanged.stored.includes('0.02'),
+  JSON.stringify(incChanged));
+
+await page.evaluate(() => window.__FL__.setUnits('centimeter'));
+await page.waitForTimeout(150);
+const incCm = await page.evaluate(() => ({
+  t: document.getElementById('inc-translate').value,
+  unit: document.getElementById('inc-translate-unit').textContent,
+  tSnap: window.__FL__.editor.gizmo.translationSnap,
+}));
+ok('translate increment follows m/cm display',
+  incCm.t === '2' && incCm.unit === 'cm' && Math.abs(incCm.tSnap - 0.02) < 1e-9,
+  JSON.stringify(incCm));
+await page.evaluate(() => window.__FL__.setUnits('meter'));
+await page.waitForTimeout(150);
+
+// Drag a rotation field: 40 px = 10 steps of the 10° rotate increment.
+const rotBefore = await page.evaluate(() => window.__FL__.transformTool.pending.rotX);
+const rotDrag = await page.evaluate(() => {
+  const group = [...document.querySelectorAll('#panel-body .group')]
+    .find((g) => g.querySelector('.gtitle')?.textContent === 'Rotation (degrees)');
+  const input = group.querySelector('input');
+  const r = input.getBoundingClientRect();
+  const opts = { bubbles: true, button: 0, pointerId: 7, clientX: r.left + 10, clientY: r.top + r.height / 2 };
+  input.dispatchEvent(new PointerEvent('pointerdown', opts));
+  input.dispatchEvent(new PointerEvent('pointermove', { ...opts, clientX: r.left + 50 }));
+  input.dispatchEvent(new PointerEvent('pointerup', { ...opts, clientX: r.left + 50 }));
+  return { value: input.value, pending: window.__FL__.transformTool.pending.rotX };
+});
+ok('rotation field drag uses rotate increment',
+  Math.abs(rotDrag.pending - rotBefore - 100) < 1e-6 &&
+  Math.abs(parseFloat(rotDrag.value) - rotDrag.pending) < 1e-6,
+  JSON.stringify({ rotBefore, ...rotDrag }));
+
+// Simple click focuses the field; typing + Enter commits directly.
+const rotRect = await page.evaluate(() => {
+  const group = [...document.querySelectorAll('#panel-body .group')]
+    .find((g) => g.querySelector('.gtitle')?.textContent === 'Rotation (degrees)');
+  const r = group.querySelector('input').getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+});
+await page.mouse.click(rotRect.x, rotRect.y);
+const rotFocused = await page.evaluate(() => document.activeElement?.tagName === 'INPUT');
+await page.keyboard.press('Control+A');
+await page.keyboard.type('12.5');
+await page.keyboard.press('Enter');
+await page.waitForTimeout(150);
+const rotTyped = await page.evaluate(() => window.__FL__.transformTool.pending.rotX);
+ok('transform field click allows direct typing',
+  rotFocused && Math.abs(rotTyped - 12.5) < 1e-6,
+  JSON.stringify({ rotFocused, rotTyped }));
+
+// Drag a translation field: 40 px = 10 steps of the 0.02 m increment.
+const transBefore = await page.evaluate(() => window.__FL__.transformTool.pending.tx);
+const transDrag = await page.evaluate(() => {
+  const group = [...document.querySelectorAll('#panel-body .group')]
+    .find((g) => g.querySelector('.gtitle')?.textContent === 'Translation');
+  const input = group.querySelector('input');
+  const r = input.getBoundingClientRect();
+  const opts = { bubbles: true, button: 0, pointerId: 9, clientX: r.left + 10, clientY: r.top + r.height / 2 };
+  input.dispatchEvent(new PointerEvent('pointerdown', opts));
+  input.dispatchEvent(new PointerEvent('pointermove', { ...opts, clientX: r.left + 50 }));
+  input.dispatchEvent(new PointerEvent('pointerup', { ...opts, clientX: r.left + 50 }));
+  return { value: input.value, pending: window.__FL__.transformTool.pending.tx };
+});
+ok('translation field drag uses translate increment',
+  Math.abs(transDrag.pending - transBefore - 0.2) < 1e-6 &&
+  Math.abs(parseFloat(transDrag.value) - (transBefore + 0.2)) < 1e-3,
+  JSON.stringify({ transBefore, ...transDrag }));
+
+// Drag a scale factor field: 40 px = 10 steps of the 0.05 scale increment.
+const scaleBefore = await page.evaluate(() => window.__FL__.transformTool.pending.sx);
+const scaleDrag = await page.evaluate(() => {
+  const group = [...document.querySelectorAll('#panel-body .group')]
+    .find((g) => g.querySelector('.gtitle')?.textContent === 'Scale');
+  const input = group.querySelector('input');
+  const r = input.getBoundingClientRect();
+  const opts = { bubbles: true, button: 0, pointerId: 11, clientX: r.left + 10, clientY: r.top + r.height / 2 };
+  input.dispatchEvent(new PointerEvent('pointerdown', opts));
+  input.dispatchEvent(new PointerEvent('pointermove', { ...opts, clientX: r.left + 50 }));
+  input.dispatchEvent(new PointerEvent('pointerup', { ...opts, clientX: r.left + 50 }));
+  return { value: input.value, pending: window.__FL__.transformTool.pending.sx };
+});
+ok('scale field drag uses scale increment',
+  Math.abs(scaleDrag.pending - scaleBefore - 0.5) < 1e-6 &&
+  Math.abs(parseFloat(scaleDrag.value) - scaleDrag.pending) < 1e-6,
+  JSON.stringify({ scaleBefore, ...scaleDrag }));
+
+// Restore defaults and the FFD panel for the i18n checks below.
+await page.evaluate(() => {
+  window.__FL__.transformTool.resetPending();
+  window.__FL__.transformTool.clearPreview();
+  window.__FL__.refTool.resetTransform();
+  window.__FL__.setUnits('meter');
+});
+await page.evaluate(() => {
+  const set = (id, v) => {
+    const el = document.getElementById(id);
+    el.value = String(v);
+    el.dispatchEvent(new Event('change'));
+  };
+  set('inc-translate', '0.01');
+  set('inc-rotate', '5');
+  set('inc-scale', '0.01');
+});
+await page.evaluate(() => window.__FL__.setTool('ffd'));
+await page.waitForTimeout(200);
+
+// ---- 11. i18n: EN | 中文 switch at the top-right
 const langDefault = await page.evaluate(() => {
   const sw = document.getElementById('lang-switch');
   const r = sw.getBoundingClientRect();
@@ -2491,6 +2642,8 @@ const zh = await page.evaluate(() => {
     modelText: document.getElementById('tool-model').textContent,
     floorLabelText: document.querySelector('[data-i18n="topbar.floor"]').textContent,
     labelText: document.querySelector('[data-i18n="topbar.label"]').textContent,
+    incLabels: [...document.querySelectorAll('#increment-group .inc-key')].map((e) => e.textContent),
+    incTitle: document.getElementById('inc-translate').title,
     panelTitle: document.getElementById('panel-title').textContent,
     subTabs: [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent),
     groupTitles: [...document.querySelectorAll('#panel-body .gtitle')].map((b) => b.textContent),
@@ -2507,6 +2660,7 @@ ok('Chinese switch translates topbar, toolbar, panel, status, nav + 3D labels',
   zh.title === '地面找平编辑器' &&
   zh.importText === '导入…' && zh.modelText === '模型' &&
   zh.floorLabelText === '地面' && zh.labelText === '标签' &&
+  zh.incLabels.join('|') === '移|旋|缩' && zh.incTitle === '平移增量' &&
   zh.panelTitle === '自由变形（FFD）' &&
   zh.subTabs.join('|') === '信息|变换|FFD' &&
   zh.groupTitles.includes('晶格') && zh.groupTitles.includes('选择') &&
@@ -2567,6 +2721,8 @@ const en = await page.evaluate(() => {
     htmlLang: document.documentElement.lang,
     title: document.title,
     importText: document.getElementById('btn-import').textContent,
+    incLabels: [...document.querySelectorAll('#increment-group .inc-key')].map((e) => e.textContent),
+    incTitle: document.getElementById('inc-translate').title,
     panelTitle: document.getElementById('panel-title').textContent,
     subTabs: [...document.querySelectorAll('#subtabs button')].map((b) => b.textContent),
     navLabel: document.querySelector('.navgizmo-viewlabel').textContent,
@@ -2578,6 +2734,7 @@ const en = await page.evaluate(() => {
 ok('switching back to EN restores English UI + 3D labels',
   en.lang === 'en' && en.active === 'en' && en.htmlLang === 'en' &&
   en.title === 'Floor Leveling Editor' && en.importText === 'Import…' &&
+  en.incLabels.join('|') === 'T|R|S' && en.incTitle === 'Translate increment' &&
   en.panelTitle === 'Free-Form Deformation (FFD)' &&
   en.subTabs.join('|') === 'Info|Transform|FFD' &&
   (en.navLabel.includes('Perspective') || en.navLabel.includes('Orthographic') || en.navLabel.includes('Isometric')) &&

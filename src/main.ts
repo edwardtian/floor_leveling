@@ -21,11 +21,13 @@ import {
   getLang, initLang, onLangChange, setLang, t,
   type Lang, type TranslationKey,
 } from './i18n';
+import { getIncrements, initIncrements, onIncrementsChange, setIncrement } from './increments';
 
 // ---------- core state ----------
 
 // Resolve the saved/initial language BEFORE any UI or 3D label is built.
 initLang();
+initIncrements();
 
 const history = new History();
 const viewport = document.getElementById('viewport')!;
@@ -378,6 +380,59 @@ for (const b of document.querySelectorAll<HTMLButtonElement>('#lang-switch butto
     if (lang === 'en' || lang === 'zh') setLang(lang); // listener applies the UI
   });
 }
+
+// ---------- transform increments (topbar) ----------
+
+const incTranslateInput = document.getElementById('inc-translate') as HTMLInputElement;
+const incRotateInput = document.getElementById('inc-rotate') as HTMLInputElement;
+const incScaleInput = document.getElementById('inc-scale') as HTMLInputElement;
+const incTranslateUnit = document.getElementById('inc-translate-unit') as HTMLSpanElement;
+
+function fmtCompact(v: number, decimals: number): string {
+  return String(Number(v.toFixed(decimals)));
+}
+
+/** Show the translate increment in the active display unit; others as-is. */
+function syncIncrementInputs(): void {
+  const inc = getIncrements();
+  const tv = units === 'meter' ? inc.translate : inc.translate * 100;
+  incTranslateInput.value = fmtCompact(tv, units === 'meter' ? 3 : 1);
+  incTranslateInput.step = units === 'meter' ? '0.01' : '1';
+  incTranslateUnit.textContent = units === 'meter' ? 'm' : 'cm';
+  incRotateInput.value = fmtCompact(inc.rotate, 3);
+  incScaleInput.value = fmtCompact(inc.scale, 3);
+}
+
+function applyGizmoIncrements(): void {
+  const inc = getIncrements();
+  editor.gizmo.translationSnap = inc.translate > 0 ? inc.translate : null;
+  editor.gizmo.rotationSnap = inc.rotate > 0 ? THREE.MathUtils.degToRad(inc.rotate) : null;
+  editor.gizmo.scaleSnap = inc.scale > 0 ? inc.scale : null;
+}
+
+function readIncrementInput(input: HTMLInputElement, kind: 'translate' | 'rotate' | 'scale'): void {
+  const v = parseFloat(input.value);
+  if (!Number.isFinite(v) || v < 0) {
+    syncIncrementInputs();
+    return;
+  }
+  // The translate input is shown in the active display unit; the module
+  // stores scene meters.
+  const value = kind === 'translate' && units === 'centimeter' ? v / 100 : v;
+  setIncrement(kind, value);
+  syncIncrementInputs();
+}
+
+incTranslateInput.addEventListener('change', () => readIncrementInput(incTranslateInput, 'translate'));
+incRotateInput.addEventListener('change', () => readIncrementInput(incRotateInput, 'rotate'));
+incScaleInput.addEventListener('change', () => readIncrementInput(incScaleInput, 'scale'));
+
+onIncrementsChange(() => {
+  applyGizmoIncrements();
+  syncIncrementInputs();
+});
+syncIncrementInputs();
+applyGizmoIncrements();
 
 /**
  * Mirror the topbar checkboxes to the live object state: Floor visible =
@@ -779,6 +834,7 @@ function setUnits(u: MeasurementUnits): void {
   editor.units = u;
   editor.rebuildGrid();
   for (const r of unitRefreshers) r();
+  syncIncrementInputs();
   buildPanel();
 }
 
@@ -797,12 +853,12 @@ function buildTransformPanel(): void {
   const gr = group(t('transform.rotation'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
     const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
-    gr.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = v; transformTool.preview(); refreshAll(); }, { step: 1, axis: ax }));
+    gr.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = v; transformTool.preview(); refreshAll(); }, { step: 1, axis: ax, increment: 'rotate' }));
   }
 
   const gt = group(t('transform.translation'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
-    const f = unitField(ax.toUpperCase(), pending[`t${ax}`], () => units, (v) => { pending[`t${ax}`] = v; transformTool.preview(); refreshAll(); }, { axis: ax });
+    const f = unitField(ax.toUpperCase(), pending[`t${ax}`], () => units, (v) => { pending[`t${ax}`] = v; transformTool.preview(); refreshAll(); }, { axis: ax, increment: 'translate' });
     unitRefreshers.push(f.refresh);
     gt.body.appendChild(f.root);
   }
@@ -810,7 +866,7 @@ function buildTransformPanel(): void {
   const gs = group(t('transform.scale'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
     const k = `s${ax}` as 'sx' | 'sy' | 'sz';
-    gs.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = nonZeroScale(v); transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+    gs.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = nonZeroScale(v); transformTool.preview(); refreshAll(); }, { step: 0.05, axis: ax, increment: 'scale' }));
   }
 
   const ga = group(t('transform.applyGroup'), panelBody);
@@ -866,18 +922,18 @@ function buildNodeTransformPanel(
     gr.body.appendChild(numField(t('ref.spin'), options.getSpin?.() ?? 0, (v) => {
       options.setSpin?.(v);
       refreshAll();
-    }, { step: 1 }));
+    }, { step: 1, increment: 'rotate' }));
   } else {
     const gr = group(t('transform.rotation'), panelBody);
     for (const ax of ['x', 'y', 'z'] as const) {
       const k = `rot${ax.toUpperCase()}` as 'rotX' | 'rotY' | 'rotZ';
-      gr.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = v; nt.preview(); refreshAll(); }, { step: 1, axis: ax }));
+      gr.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = v; nt.preview(); refreshAll(); }, { step: 1, axis: ax, increment: 'rotate' }));
     }
   }
 
   const gt = group(t('transform.translation'), panelBody);
   for (const ax of ['x', 'y', 'z'] as const) {
-    const f = unitField(ax.toUpperCase(), pending[`t${ax}`], () => units, (v) => { pending[`t${ax}`] = v; nt.preview(); refreshAll(); }, { axis: ax });
+    const f = unitField(ax.toUpperCase(), pending[`t${ax}`], () => units, (v) => { pending[`t${ax}`] = v; nt.preview(); refreshAll(); }, { axis: ax, increment: 'translate' });
     unitRefreshers.push(f.refresh);
     gt.body.appendChild(f.root);
   }
@@ -886,7 +942,7 @@ function buildNodeTransformPanel(
   const scaleAxes = options?.scaleAxes === 'xy' ? (['x', 'y'] as const) : (['x', 'y', 'z'] as const);
   for (const ax of scaleAxes) {
     const k = `s${ax}` as 'sx' | 'sy' | 'sz';
-    gs.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = nonZeroScale(v); nt.preview(); refreshAll(); }, { step: 0.05, axis: ax }));
+    gs.body.appendChild(numField(ax.toUpperCase(), pending[k], (v) => { pending[k] = nonZeroScale(v); nt.preview(); refreshAll(); }, { step: 0.05, axis: ax, increment: 'scale' }));
   }
 
   const ga = group(t('transform.applyGroup'), panelBody);
@@ -1031,12 +1087,12 @@ function buildFloorPanel(): void {
   // model / floor / ref image.
   const nt = floorTool.nodeTransform;
   const previewed = () => nt.previewedTRS();
-  const fx = unitField(t('floor.widthX'), s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); }, { axis: 'x' });
-  const fz = unitField(t('floor.depthZ'), s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); }, { axis: 'z' });
-  const fy = unitField(t('floor.heightY'), s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); }, { axis: 'y' });
-  const fcx = unitField(t('floor.centerX'), s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); }, { axis: 'x' });
-  const fcz = unitField(t('floor.centerZ'), s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); }, { axis: 'z' });
-  const rot = numField(t('floor.spin'), floorTool.rotationDeg.y, (v) => nt.setWorldRotationDeg({ y: v }), { step: 1 });
+  const fx = unitField(t('floor.widthX'), s.sizeX, () => units, (v) => { s.sizeX = Math.max(0.05, v); nt.setWorldScale({ x: s.sizeX }); floorTool.syncFromGizmo(); }, { axis: 'x', increment: 'scale', min: 0.05 });
+  const fz = unitField(t('floor.depthZ'), s.sizeZ, () => units, (v) => { s.sizeZ = Math.max(0.05, v); nt.setWorldScale({ z: s.sizeZ }); floorTool.syncFromGizmo(); }, { axis: 'z', increment: 'scale', min: 0.05 });
+  const fy = unitField(t('floor.heightY'), s.y, () => units, (v) => { s.y = v; nt.setWorldPosition({ y: s.y }); }, { axis: 'y', increment: 'translate' });
+  const fcx = unitField(t('floor.centerX'), s.cx, () => units, (v) => { s.cx = v; nt.setWorldPosition({ x: s.cx }); }, { axis: 'x', increment: 'translate' });
+  const fcz = unitField(t('floor.centerZ'), s.cz, () => units, (v) => { s.cz = v; nt.setWorldPosition({ z: s.cz }); }, { axis: 'z', increment: 'translate' });
+  const rot = numField(t('floor.spin'), floorTool.rotationDeg.y, (v) => nt.setWorldRotationDeg({ y: v }), { step: 1, increment: 'rotate' });
   const sync = () => {
     const trs = previewed();
     fx.set(trs.scale.x); fz.set(trs.scale.z); fy.set(trs.pos.y); fcx.set(trs.pos.x); fcz.set(trs.pos.z);
@@ -1345,10 +1401,10 @@ function buildRefPanel(): void {
     }
     const go = group(t('ref.placement'), panelBody);
     const st = refTool.state;
-    const fy = unitField(t('ref.heightY'), st.y, () => units, (v) => refTool.setY(v));
-    const fw = unitField(t('ref.width'), st.w, () => units, (v) => refTool.setWidth(v));
-    const fh = unitField(t('ref.height'), st.h, () => units, (v) => refTool.setHeight(v));
-    const fa = numField(t('ref.spin'), st.angleDeg, (v) => refTool.setAngleDeg(v), { step: 1 });
+    const fy = unitField(t('ref.heightY'), st.y, () => units, (v) => refTool.setY(v), { increment: 'translate' });
+    const fw = unitField(t('ref.width'), st.w, () => units, (v) => refTool.setWidth(v), { increment: 'scale', min: 0.001 });
+    const fh = unitField(t('ref.height'), st.h, () => units, (v) => refTool.setHeight(v), { increment: 'scale', min: 0.001 });
+    const fa = numField(t('ref.spin'), st.angleDeg, (v) => refTool.setAngleDeg(v), { step: 1, increment: 'rotate' });
     unitRefreshers.push(fy.refresh, fw.refresh, fh.refresh);
     go.body.append(fy.root, fw.root, fh.root, fa);
     const gop = group(t('ref.opacity'), panelBody);
@@ -1359,7 +1415,10 @@ function buildRefPanel(): void {
 
 function setStatus(text: string): void {
   const s = document.getElementById('status');
-  if (s) s.textContent = text;
+  if (s) {
+    s.textContent = text;
+    s.title = text; // full text when the topbar status is ellipsized
+  }
 }
 
 function refreshAll(): void {
