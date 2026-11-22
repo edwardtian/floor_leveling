@@ -19,6 +19,10 @@ pnpm build          # typecheck + production build (dist/)
 node scripts/smoke.mjs   # headless end-to-end test (149 checks, system Chrome)
 ```
 
+## License
+
+Released under the [MIT License](LICENSE.md).
+
 ## Workflow
 
 The toolbar on the left walks through the requirements:
